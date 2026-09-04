@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Run the k8s e2e suite against the gateway, choosing a reachable GATEWAY_URL.
+#
+# On docker, the Kind network is host-routable so the MetalLB LoadBalancer IP
+# works directly. On rootless podman the Kind network lives in a network
+# namespace and the LB IP is NOT reachable from the host, so we tunnel to the
+# gateway with `kubectl port-forward` instead. This makes `make e2e-test` work
+# out of the box on both engines.
+#
+# Extra args are forwarded to `cargo test` (e.g. `-- --nocapture`).
+set -euo pipefail
+
+CTX="${E2E_CONTEXT:-kind-praxis-e2e}"
+NS="${E2E_GATEWAY_NS:-istio-system}"
+SVC="${E2E_GATEWAY_SVC:-e2e-gateway-istio}"
+PORT="${E2E_PORT:-18080}"
+
+# Any HTTP response (even 404) means the endpoint is reachable.
+reachable() { curl -s -o /dev/null --max-time 5 "$1" 2>/dev/null; }
+
+PF_PID=""
+cleanup() { [[ -n "$PF_PID" ]] && kill "$PF_PID" 2>/dev/null || true; }
+trap cleanup EXIT
+
+LB_IP="$(kubectl --context "$CTX" -n "$NS" get svc "$SVC" \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+
+if [[ -n "$LB_IP" ]] && reachable "http://${LB_IP}/"; then
+  export GATEWAY_URL="http://${LB_IP}"
+  echo "e2e: using LoadBalancer IP ${GATEWAY_URL}"
+else
+  echo "e2e: LoadBalancer IP unreachable (rootless podman?); port-forwarding ${SVC} -> 127.0.0.1:${PORT}"
+  kubectl --context "$CTX" -n "$NS" port-forward "svc/${SVC}" "${PORT}:80" >/dev/null 2>&1 &
+  PF_PID=$!
+  for _ in $(seq 1 20); do
+    reachable "http://127.0.0.1:${PORT}/" && break
+    sleep 0.5
+  done
+  reachable "http://127.0.0.1:${PORT}/" || { echo "e2e: port-forward did not become ready" >&2; exit 1; }
+  export GATEWAY_URL="http://127.0.0.1:${PORT}"
+  echo "e2e: using ${GATEWAY_URL}"
+fi
+
+cargo test --features k8s-e2e --test k8s_e2e "$@"

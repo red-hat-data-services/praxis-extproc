@@ -1,7 +1,10 @@
 # Multi-stage build for praxis-extproc.
 #
-# Builder: ubi9/ubi with rustup (native cargo on the host platform).
-# Runtime: ubi9/ubi-minimal.
+# Builder: ubi9/ubi with AppStream rust-toolset (1.92) and openssl-devel.
+# Cargo --ignore-rust-version: crates declare rust-version 1.96; rustc 1.92
+# type-checks this tree. OPENSSL_NO_VENDOR forces openssl-sys onto system
+# libssl.so.3 (UBI9 OpenSSL) instead of a vendored copy.
+# Runtime: ubi9/ubi-minimal + openssl-libs (same SONAME).
 #
 # Build:
 #   make container-release
@@ -19,29 +22,22 @@ FROM registry.access.redhat.com/ubi9/ubi AS builder
 
 ARG CARGO_PROFILE=release
 
-RUN dnf install -y gcc gcc-c++ cmake make perl openssl-devel \
+RUN dnf install -y rust-toolset openssl-devel gcc gcc-c++ cmake make \
     && dnf clean all
 
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain none --profile minimal
+ENV OPENSSL_NO_VENDOR=1
 
 WORKDIR /build
-COPY rust-toolchain.toml .
-RUN rustup show
-
 COPY . .
+
 
 RUN set -eu; \
     if [ "${CARGO_PROFILE}" = "release" ]; then \
-      cargo build --release --bin praxis-extproc; \
+      cargo build --ignore-rust-version --release --bin praxis-extproc; \
       BIN=target/release/praxis-extproc; \
       strip "${BIN}"; \
     elif [ "${CARGO_PROFILE}" = "debug" ]; then \
-      cargo build --bin praxis-extproc; \
+      cargo build --ignore-rust-version --bin praxis-extproc; \
       BIN=target/debug/praxis-extproc; \
     else \
       echo "unsupported CARGO_PROFILE=${CARGO_PROFILE}" >&2; \

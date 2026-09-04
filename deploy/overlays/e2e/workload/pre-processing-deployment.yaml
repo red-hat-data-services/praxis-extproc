@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payload-pre-processing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payload-pre-processing
+  template:
+    metadata:
+      labels:
+        app: payload-pre-processing
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: payload-pre-processing
+          image: praxis-extproc
+          imagePullPolicy: Never
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          args:
+            - -c
+            - /etc/praxis/extproc.yaml
+          ports:
+            - containerPort: 9004
+              name: grpc
+              protocol: TCP
+            - containerPort: 50052
+              name: health
+              protocol: TCP
+            - containerPort: 9090
+              name: metrics
+              protocol: TCP
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            tcpSocket:
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            tcpSocket:
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: plugins-config-volume
+              mountPath: /etc/praxis
+              readOnly: true
+      volumes:
+        - name: plugins-config-volume
+          configMap:
+            name: payload-pre-processing-plugins

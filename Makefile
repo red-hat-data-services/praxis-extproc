@@ -4,6 +4,8 @@
 	require-container-engine \
 	container container-release images kind-up kind-down smoke-test \
 	dev-env dev-push dev-integration \
+	manifests-demo manifests-odh \
+	e2e-setup e2e-teardown e2e-test \
 	setup-hooks \
 	help
 
@@ -14,7 +16,9 @@
 CONTAINER_ENGINE  ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 V                 ?=
 KIND_CLUSTER_NAME ?= praxis-extproc
-EXTPROC_IMAGE     ?= praxis-extproc:dev
+# Fully-qualified: podman tags local builds `localhost/...`, which won't match
+# the `docker.io/library/...` Kubernetes resolves to under `imagePullPolicy: Never`.
+EXTPROC_IMAGE     ?= docker.io/library/praxis-extproc:dev
 KUBECTL           ?= kubectl --context kind-$(KIND_CLUSTER_NAME)
 
 ifneq ($(V),)
@@ -85,6 +89,7 @@ endif
 
 container: | require-container-engine
 	$(CONTAINER_ENGINE) build \
+		--no-cache \
 		--build-arg CARGO_PROFILE=debug \
 		-t $(EXTPROC_IMAGE) \
 		-f Containerfile \
@@ -117,6 +122,26 @@ smoke-test:
 	bash hack/smoke-test.sh
 
 # ---------------------------------------------------------------------------
+# E2E (Forge)
+# ---------------------------------------------------------------------------
+
+FORGE_BIN    ?= praxis-forge
+FORGE_CONFIG := forge.yaml
+INFERENCE_SIM_IMAGE ?= ghcr.io/llm-d/llm-d-inference-sim:v0.8.2
+FORGE_CMD = "$(FORGE_BIN)" --config "$(FORGE_CONFIG)" --runtime "$(notdir $(CONTAINER_ENGINE))"
+
+e2e-setup: images
+	$(FORGE_CMD) cluster create e2e
+	$(FORGE_CMD) cluster load-image e2e "$(EXTPROC_IMAGE)"
+	$(FORGE_CMD) stack apply e2e
+
+e2e-teardown:
+	$(FORGE_CMD) cluster delete e2e
+
+e2e-test:
+	bash hack/scripts/e2e-test.sh $(if $(V),-- --nocapture,)
+
+# ---------------------------------------------------------------------------
 # Iterative Development
 # ---------------------------------------------------------------------------
 
@@ -127,13 +152,19 @@ dev-env: images
 
 dev-push: container-release
 	kind load docker-image $(EXTPROC_IMAGE) --name $(KIND_CLUSTER_NAME)
-	$(KUBECTL) -n praxis-extproc rollout restart deployment/praxis-extproc
-	$(KUBECTL) -n praxis-extproc rollout status deployment/praxis-extproc --timeout=120s
+	$(KUBECTL) -n praxis-extproc rollout restart deployment/payload-processing
+	$(KUBECTL) -n praxis-extproc rollout status deployment/payload-processing --timeout=120s
 
 dev-integration:
 	@kind get kubeconfig --name $(KIND_CLUSTER_NAME) > /tmp/kind-$(KIND_CLUSTER_NAME).kubeconfig
 	KUBECONFIG=/tmp/kind-$(KIND_CLUSTER_NAME).kubeconfig \
 	cargo test --features integration -- --ignored $(if $(V),--nocapture,)
+
+manifests-demo:
+	@kubectl kustomize deploy/overlays/demo
+
+manifests-odh:
+	@kubectl kustomize deploy/overlays/odh
 
 # ---------------------------------------------------------------------------
 # Dev Setup
@@ -152,7 +183,7 @@ help:
 	@echo "  V=1                show test output (--nocapture)"
 	@echo "  CONTAINER_ENGINE   container runtime (auto-detected)"
 	@echo "  KIND_CLUSTER_NAME  KIND cluster name (default: praxis-extproc)"
-	@echo "  EXTPROC_IMAGE      container image tag (default: praxis-extproc:dev)"
+	@echo "  EXTPROC_IMAGE      container image tag (default: docker.io/library/praxis-extproc:dev)"
 	@echo ""
 	@echo "Top-level:"
 	@echo "  all              build + lint + test + audit"
@@ -183,6 +214,15 @@ help:
 	@echo "  kind-up          create cluster + deploy"
 	@echo "  kind-down        delete cluster"
 	@echo "  smoke-test       run smoke tests against cluster"
+	@echo ""
+	@echo "Manifests:"
+	@echo "  manifests-demo   kubectl kustomize deploy/overlays/demo"
+	@echo "  manifests-odh    kubectl kustomize deploy/overlays/odh"
+	@echo ""
+	@echo "E2E (Forge):"
+	@echo "  e2e-setup        create Kind cluster + install all stacks"
+	@echo "  e2e-teardown     delete Kind e2e cluster"
+	@echo "  e2e-test         run k8s e2e tests against cluster"
 	@echo ""
 	@echo "Dev Setup:"
 	@echo "  setup-hooks      install git pre-commit hook"

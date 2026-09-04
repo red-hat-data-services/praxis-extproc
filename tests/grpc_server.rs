@@ -895,7 +895,7 @@ async fn repro_ap_post_eos_headers() {
 }
 
 #[tokio::test]
-async fn wrong_wire_mode_unsupported_streamed_rejected() {
+async fn wrong_wire_mode_unsupported_buffered_partial_rejected() {
     use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
 
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
@@ -905,8 +905,8 @@ async fn wrong_wire_mode_unsupported_streamed_rejected() {
 
     let mut headers = make_request_headers("POST", "/submit", false);
     headers.protocol_config = Some(ProtocolConfiguration {
-        request_body_mode: 1, // STREAMED — not implemented
-        response_body_mode: 1,
+        request_body_mode: 3, // BUFFERED_PARTIAL — not implemented
+        response_body_mode: 3,
         send_body_without_waiting_for_header_response: false,
     });
     tx.send(headers).await.unwrap();
@@ -921,24 +921,21 @@ async fn wrong_wire_mode_unsupported_streamed_rejected() {
             assert_eq!(
                 err.code(),
                 tonic::Code::InvalidArgument,
-                "ap-wrong-wire-mode: expected InvalidArgument for STREAMED mode, got {}: {}",
+                "expected InvalidArgument for BUFFERED_PARTIAL mode, got {}: {}",
                 err.code(),
                 err.message()
             );
             assert!(
-                err.message().contains("STREAMED") || err.message().contains("not yet implemented"),
-                "error message should mention STREAMED or not implemented, got: {}",
+                err.message().contains("BUFFERED_PARTIAL") || err.message().contains("not yet implemented"),
+                "error message should mention BUFFERED_PARTIAL or not implemented, got: {}",
                 err.message()
             );
         },
         Ok(Ok(Some(msg))) => {
-            panic!(
-                "ap-wrong-wire-mode REPRODUCED BUG: expected InvalidArgument for unsupported mode, \
-                 got success response: {msg:?}"
-            );
+            panic!("expected InvalidArgument for unsupported mode, got success response: {msg:?}");
         },
-        Ok(Ok(None)) => panic!("ap-wrong-wire-mode: stream closed without error"),
-        Err(_) => panic!("ap-wrong-wire-mode: timed out waiting for rejection"),
+        Ok(Ok(None)) => panic!("stream closed without error"),
+        Err(_) => panic!("timed out waiting for rejection"),
     }
 }
 
@@ -954,7 +951,7 @@ async fn unsupported_response_body_mode_rejected() {
     let mut headers = make_request_headers("POST", "/submit", false);
     headers.protocol_config = Some(ProtocolConfiguration {
         request_body_mode: 2,
-        response_body_mode: 1,
+        response_body_mode: 3, // BUFFERED_PARTIAL — not implemented
         send_body_without_waiting_for_header_response: false,
     });
     tx.send(headers).await.unwrap();
@@ -1001,7 +998,7 @@ async fn empty_full_duplex_emits_streamed_eos() {
     });
     tx.send(headers).await.unwrap();
 
-    let _unused = response_stream.message().await.unwrap();
+    // FDS: no response at header time
 
     tx.send(ProcessingRequest {
         request: Some(ReqVariant::RequestBody(HttpBody {
@@ -1013,49 +1010,47 @@ async fn empty_full_duplex_emits_streamed_eos() {
     .await
     .unwrap();
 
-    let outcome = tokio::time::timeout(
+    // First response: HeadersResponse (deferred from header phase)
+    let hdr_msg = tokio::time::timeout(
         std::time::Duration::from_millis(TIMEOUT_MILLIS),
         response_stream.message(),
     )
-    .await;
+    .await
+    .expect("timed out waiting for header response")
+    .expect("header response stream error")
+    .expect("stream closed before header response");
+    assert!(
+        matches!(hdr_msg.response, Some(RespVariant::RequestHeaders(_))),
+        "first response should be HeadersResponse, got: {hdr_msg:?}"
+    );
 
-    match outcome {
-        Ok(Ok(Some(msg))) => {
-            let has_streamed = matches!(
-                &msg.response,
-                Some(RespVariant::RequestBody(b))
-                    if matches!(
-                        b.response.as_ref()
-                            .and_then(|c| c.body_mutation.as_ref())
-                            .and_then(|m| m.mutation.as_ref()),
-                        Some(body_mutation::Mutation::StreamedResponse(_))
-                    )
-            );
-            assert!(
-                has_streamed,
-                "expected StreamedBodyResponse for empty FULL_DUPLEX body, got: {msg:?}"
-            );
+    // Second response: StreamedBodyResponse with empty body + EOS
+    let body_msg = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for body response")
+    .expect("body response stream error")
+    .expect("stream closed before body response");
 
-            if let Some(RespVariant::RequestBody(b)) = &msg.response
-                && let Some(body_mutation::Mutation::StreamedResponse(s)) = b
-                    .response
-                    .as_ref()
-                    .and_then(|c| c.body_mutation.as_ref())
-                    .and_then(|m| m.mutation.as_ref())
-            {
-                assert!(
-                    s.body.is_empty(),
-                    "empty FULL_DUPLEX streamed chunk should have empty body"
-                );
-                assert!(
-                    s.end_of_stream,
-                    "empty FULL_DUPLEX streamed chunk must set end_of_stream"
-                );
-            }
-        },
-        Ok(Ok(None)) => panic!("ap-empty-full-duplex: stream closed without response"),
-        Ok(Err(err)) => panic!("ap-empty-full-duplex: stream error: {err}"),
-        Err(_) => panic!("ap-empty-full-duplex: timed out waiting for response"),
+    if let Some(RespVariant::RequestBody(b)) = &body_msg.response
+        && let Some(body_mutation::Mutation::StreamedResponse(s)) = b
+            .response
+            .as_ref()
+            .and_then(|c| c.body_mutation.as_ref())
+            .and_then(|m| m.mutation.as_ref())
+    {
+        assert!(
+            s.body.is_empty(),
+            "empty FULL_DUPLEX streamed chunk should have empty body"
+        );
+        assert!(
+            s.end_of_stream,
+            "empty FULL_DUPLEX streamed chunk must set end_of_stream"
+        );
+    } else {
+        panic!("expected StreamedBodyResponse for empty FULL_DUPLEX body, got: {body_msg:?}");
     }
 }
 
@@ -1076,14 +1071,7 @@ async fn full_duplex_single_chunk_request_body() {
     });
     tx.send(headers).await.unwrap();
 
-    let _header_resp = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for header response")
-    .expect("header response stream error")
-    .expect("stream closed before header response");
+    // FDS: no response at header time
 
     let body_data = vec![0_u8; 1024];
     tx.send(ProcessingRequest {
@@ -1096,30 +1084,41 @@ async fn full_duplex_single_chunk_request_body() {
     .await
     .unwrap();
 
-    let outcome = tokio::time::timeout(
+    // First response: HeadersResponse (deferred from header phase)
+    let hdr_msg = tokio::time::timeout(
         std::time::Duration::from_millis(TIMEOUT_MILLIS),
         response_stream.message(),
     )
-    .await;
+    .await
+    .expect("timed out waiting for header response")
+    .expect("header response stream error")
+    .expect("stream closed before header response");
+    assert!(
+        matches!(hdr_msg.response, Some(RespVariant::RequestHeaders(_))),
+        "first response should be HeadersResponse, got: {hdr_msg:?}"
+    );
 
-    match outcome {
-        Ok(Ok(Some(msg))) => {
-            if let Some(RespVariant::RequestBody(b)) = &msg.response
-                && let Some(body_mutation::Mutation::StreamedResponse(s)) = b
-                    .response
-                    .as_ref()
-                    .and_then(|c| c.body_mutation.as_ref())
-                    .and_then(|m| m.mutation.as_ref())
-            {
-                assert_eq!(s.body.len(), body_data.len(), "streamed chunk should contain full body");
-                assert!(s.end_of_stream, "single chunk should set end_of_stream");
-            } else {
-                panic!("expected StreamedResponse for FULL_DUPLEX request body, got: {msg:?}");
-            }
-        },
-        Ok(Ok(None)) => panic!("stream closed without response"),
-        Ok(Err(err)) => panic!("stream error: {err}"),
-        Err(_) => panic!("timed out waiting for response"),
+    // Second response: StreamedBodyResponse with body data + EOS
+    let body_msg = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for body response")
+    .expect("body response stream error")
+    .expect("stream closed before body response");
+
+    if let Some(RespVariant::RequestBody(b)) = &body_msg.response
+        && let Some(body_mutation::Mutation::StreamedResponse(s)) = b
+            .response
+            .as_ref()
+            .and_then(|c| c.body_mutation.as_ref())
+            .and_then(|m| m.mutation.as_ref())
+    {
+        assert_eq!(s.body.len(), body_data.len(), "streamed chunk should contain full body");
+        assert!(s.end_of_stream, "single chunk should set end_of_stream");
+    } else {
+        panic!("expected StreamedResponse for FULL_DUPLEX request body, got: {body_msg:?}");
     }
 }
 
@@ -1141,14 +1140,7 @@ async fn full_duplex_multi_chunk_request_body() {
     });
     tx.send(headers).await.unwrap();
 
-    let _header_resp = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for header response")
-    .expect("header response stream error")
-    .expect("stream closed before header response");
+    // FDS: no response at header time
 
     let body_data: Vec<u8> = (0_u32..100_000).map(|i| (i % 251) as u8).collect();
     tx.send(ProcessingRequest {
@@ -1161,6 +1153,21 @@ async fn full_duplex_multi_chunk_request_body() {
     .await
     .unwrap();
 
+    // First response: HeadersResponse (deferred from header phase)
+    let hdr_msg = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for header response")
+    .expect("header response stream error")
+    .expect("stream closed before header response");
+    assert!(
+        matches!(hdr_msg.response, Some(RespVariant::RequestHeaders(_))),
+        "first response should be HeadersResponse, got: {hdr_msg:?}"
+    );
+
+    // Remaining responses: streamed body chunks
     let (chunks, received_body) = collect_streamed_chunks(
         &mut response_stream,
         |msg| {
@@ -1187,6 +1194,84 @@ async fn full_duplex_multi_chunk_request_body() {
         chunks.last().unwrap().end_of_stream,
         "final chunk must set end_of_stream"
     );
+}
+
+#[tokio::test]
+async fn full_duplex_headers_prepended_only_to_first_chunk() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/upload", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 4,
+        response_body_mode: 2,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.unwrap();
+
+    // FDS: no response at header time. Send three discrete body messages;
+    // small bodies keep a 1:1 message-to-chunk mapping (no server-side split).
+    let eos_flags = [false, false, true];
+    for (i, eos) in eos_flags.iter().enumerate() {
+        tx.send(ProcessingRequest {
+            request: Some(ReqVariant::RequestBody(HttpBody {
+                body: vec![u8::try_from(i).expect("should expect chunks"); 16],
+                end_of_stream: *eos,
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    // First chunk: deferred RequestHeaders must precede the body response.
+    let hdr_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(hdr_msg.response, Some(RespVariant::RequestHeaders(_))),
+        "first response should be deferred HeadersResponse, got: {hdr_msg:?}"
+    );
+    let first_body = next_full_duplex_msg(&mut response_stream).await;
+    assert_eq!(
+        streamed_eos(&first_body),
+        Some(false),
+        "first chunk must propagate source EOS=false, got: {first_body:?}"
+    );
+
+    // Subsequent chunks: body responses only, never preceded by RequestHeaders,
+    // and each must propagate the source chunk's own end_of_stream flag.
+    for (chunk, &eos) in eos_flags.iter().enumerate().skip(1) {
+        let msg = next_full_duplex_msg(&mut response_stream).await;
+        assert_eq!(
+            streamed_eos(&msg),
+            Some(eos),
+            "chunk {chunk} should propagate source EOS={eos}, got: {msg:?}"
+        );
+    }
+}
+
+/// Extract `end_of_stream` from a streamed request-body response, if present.
+fn streamed_eos(msg: &ProcessingResponse) -> Option<bool> {
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
+    match msg.response.as_ref()? {
+        RespVariant::RequestBody(b) => match b.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()? {
+            body_mutation::Mutation::StreamedResponse(s) => Some(s.end_of_stream),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Pull the next response from a `FULL_DUPLEX` stream with the shared timeout.
+async fn next_full_duplex_msg(stream: &mut tonic::Streaming<ProcessingResponse>) -> ProcessingResponse {
+    tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MILLIS), stream.message())
+        .await
+        .expect("timed out waiting for response")
+        .expect("response stream error")
+        .expect("stream closed before response")
 }
 
 #[tokio::test]
@@ -1218,7 +1303,7 @@ async fn full_duplex_response_body() {
 
     tx.send(make_response_headers(200, false)).await.unwrap();
 
-    let _resp_header_resp = response_stream.message().await.unwrap();
+    // FDS response: no response at response header time
 
     let body_data: Vec<u8> = (0_u32..100_000).map(|i| (i % 251) as u8).collect();
     tx.send(ProcessingRequest {
@@ -1231,6 +1316,21 @@ async fn full_duplex_response_body() {
     .await
     .unwrap();
 
+    // First response after body EOS: ResponseHeaders (deferred)
+    let hdr_msg = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for response header response")
+    .expect("response header stream error")
+    .expect("stream closed before response header response");
+    assert!(
+        matches!(hdr_msg.response, Some(RespVariant::ResponseHeaders(_))),
+        "first response should be ResponseHeaders, got: {hdr_msg:?}"
+    );
+
+    // Remaining responses: streamed body chunks
     let (chunks, received_body) = collect_streamed_chunks(
         &mut response_stream,
         |msg| {
@@ -1256,6 +1356,409 @@ async fn full_duplex_response_body() {
     assert!(
         chunks.last().unwrap().end_of_stream,
         "final chunk must set end_of_stream"
+    );
+}
+
+#[tokio::test]
+async fn streamed_single_chunk_request_body() {
+    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/upload", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 1, // STREAMED
+        response_body_mode: 1,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.unwrap();
+
+    let _header_resp = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for header response")
+    .expect("header response stream error")
+    .expect("stream closed before header response");
+
+    let body_data = b"streamed body content";
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: body_data.to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let msg = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out")
+    .expect("stream error")
+    .expect("stream closed");
+
+    if let Some(RespVariant::RequestBody(b)) = &msg.response
+        && let Some(body_mutation::Mutation::Body(bytes)) = b
+            .response
+            .as_ref()
+            .and_then(|c| c.body_mutation.as_ref())
+            .and_then(|m| m.mutation.as_ref())
+    {
+        assert_eq!(bytes, body_data, "STREAMED chunk should echo body data");
+    } else {
+        panic!("expected BodyMutation::Body for STREAMED request body, got: {msg:?}");
+    }
+}
+
+#[tokio::test]
+async fn streamed_multi_chunk_request_body() {
+    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/upload", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 1, // STREAMED
+        response_body_mode: 1,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.unwrap();
+
+    let _header_resp = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for header response")
+    .expect("header response stream error")
+    .expect("stream closed before header response");
+
+    let chunks: &[&[u8]] = &[b"chunk-1-", b"chunk-2-", b"chunk-3"];
+    let mut received_body = Vec::new();
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let is_last = i == chunks.len() - 1;
+
+        tx.send(ProcessingRequest {
+            request: Some(ReqVariant::RequestBody(HttpBody {
+                body: chunk.to_vec(),
+                end_of_stream: is_last,
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // Half-duplex: must get a response before sending next chunk
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_millis(TIMEOUT_MILLIS),
+            response_stream.message(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for response to chunk {i}"))
+        .unwrap_or_else(|e| panic!("stream error on chunk {i}: {e}"))
+        .unwrap_or_else(|| panic!("stream closed before response to chunk {i}"));
+
+        if let Some(RespVariant::RequestBody(b)) = &msg.response {
+            if let Some(body_mutation::Mutation::Body(bytes)) = b
+                .response
+                .as_ref()
+                .and_then(|c| c.body_mutation.as_ref())
+                .and_then(|m| m.mutation.as_ref())
+            {
+                received_body.extend_from_slice(bytes);
+            }
+        } else {
+            panic!("expected RequestBody response for chunk {i}, got: {msg:?}");
+        }
+    }
+
+    let expected: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+    assert_eq!(received_body, expected, "reassembled body should match input chunks");
+}
+
+#[tokio::test]
+async fn streamed_empty_body() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/empty", false);
+    headers.protocol_config = Some(praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration {
+        request_body_mode: 1, // STREAMED
+        response_body_mode: 2,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.unwrap();
+
+    let _header_resp = response_stream.message().await.unwrap();
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: Vec::new(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let msg = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out")
+    .expect("stream error")
+    .expect("stream closed");
+
+    assert!(
+        matches!(&msg.response, Some(RespVariant::RequestBody(_))),
+        "empty STREAMED body should still produce a RequestBody response"
+    );
+}
+
+#[tokio::test]
+async fn streamed_response_body() {
+    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("GET", "/", true);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 2,
+        response_body_mode: 1, // STREAMED
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.unwrap();
+
+    let _req_header_resp = response_stream.message().await.unwrap();
+
+    tx.send(make_response_headers(200, false)).await.unwrap();
+    let _resp_header_resp = response_stream.message().await.unwrap();
+
+    let chunks: &[&[u8]] = &[b"resp-1-", b"resp-2"];
+    let mut received_body = Vec::new();
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let is_last = i == chunks.len() - 1;
+
+        tx.send(ProcessingRequest {
+            request: Some(ReqVariant::ResponseBody(HttpBody {
+                body: chunk.to_vec(),
+                end_of_stream: is_last,
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_millis(TIMEOUT_MILLIS),
+            response_stream.message(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for response body chunk {i}"))
+        .unwrap_or_else(|e| panic!("stream error on response body chunk {i}: {e}"))
+        .unwrap_or_else(|| panic!("stream closed before response body chunk {i}"));
+
+        if let Some(RespVariant::ResponseBody(b)) = &msg.response {
+            if let Some(body_mutation::Mutation::Body(bytes)) = b
+                .response
+                .as_ref()
+                .and_then(|c| c.body_mutation.as_ref())
+                .and_then(|m| m.mutation.as_ref())
+            {
+                received_body.extend_from_slice(bytes);
+            }
+        } else {
+            panic!("expected ResponseBody for chunk {i}, got: {msg:?}");
+        }
+    }
+
+    let expected: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+    assert_eq!(received_body, expected, "reassembled response body should match");
+}
+
+#[tokio::test]
+async fn streamed_guardrails_rejects_on_matching_chunk() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/api", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 1, // STREAMED
+        response_body_mode: 2,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.unwrap();
+    let _header_resp = response_stream.message().await.unwrap();
+
+    // First chunk: clean content — should get a normal body response
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"SELECT name FROM users".to_vec(),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let msg1 = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out on chunk 1")
+    .expect("stream error on chunk 1")
+    .expect("stream closed on chunk 1");
+
+    assert!(
+        matches!(&msg1.response, Some(RespVariant::RequestBody(_))),
+        "clean chunk should produce RequestBody, got: {msg1:?}"
+    );
+
+    // Second chunk: blocked content — should get ImmediateResponse
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"DROP TABLE users".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let msg2 = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out on chunk 2")
+    .expect("stream error on chunk 2")
+    .expect("stream closed on chunk 2");
+
+    assert!(
+        matches!(&msg2.response, Some(RespVariant::ImmediateResponse(_))),
+        "blocked chunk should produce ImmediateResponse, got: {msg2:?}"
+    );
+}
+
+#[tokio::test]
+async fn streamed_deferred_mutation_on_first_chunk_only() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/submit", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 1, // STREAMED
+        response_body_mode: 2,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.unwrap();
+
+    // HeadersResponse should carry X-Test mutation (sent at header time)
+    let header_resp = response_stream.message().await.unwrap().unwrap();
+    let header_has_mutation = matches!(
+        &header_resp.response,
+        Some(RespVariant::RequestHeaders(h))
+            if h.response.as_ref()
+                .and_then(|c| c.header_mutation.as_ref())
+                .is_some_and(|m| m.set_headers.iter()
+                    .filter_map(|hv| hv.header.as_ref())
+                    .any(|hv| hv.key.eq_ignore_ascii_case("x-test")))
+    );
+    assert!(
+        header_has_mutation,
+        "HeadersResponse should carry X-Test header mutation, got: {header_resp:?}"
+    );
+
+    // First chunk — should NOT have header mutations (already sent at header time)
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"chunk-1".to_vec(),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let msg1 = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out on chunk 1")
+    .expect("stream error on chunk 1")
+    .expect("stream closed on chunk 1");
+
+    let first_has_mutation = matches!(
+        &msg1.response,
+        Some(RespVariant::RequestBody(b))
+            if b.response.as_ref()
+                .and_then(|c| c.header_mutation.as_ref())
+                .is_some()
+    );
+    assert!(
+        !first_has_mutation,
+        "first chunk should NOT have header mutations, got: {msg1:?}"
+    );
+
+    // Second chunk — should NOT have header mutations
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"chunk-2".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let msg2 = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out on chunk 2")
+    .expect("stream error on chunk 2")
+    .expect("stream closed on chunk 2");
+
+    let second_has_mutation = matches!(
+        &msg2.response,
+        Some(RespVariant::RequestBody(b))
+            if b.response.as_ref()
+                .and_then(|c| c.header_mutation.as_ref())
+                .is_some()
+    );
+    assert!(
+        !second_has_mutation,
+        "second chunk should NOT have header mutations, got: {msg2:?}"
     );
 }
 
