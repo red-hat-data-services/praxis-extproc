@@ -522,6 +522,7 @@ async fn run_request_pipeline(
         return Ok(vec![response::immediate(imm)]);
     }
 
+    let original_len = state.request_body.len();
     let body_reject = run_body_filters(pipeline, &mut ctx, &mut state.request_body, true).await?;
     if let Some(imm) = body_reject {
         return Ok(vec![response::immediate(imm)]);
@@ -533,10 +534,14 @@ async fn run_request_pipeline(
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
 
+    // Emit the authoritative buffer even when empty: a filter that cleared the
+    // body must produce an explicit empty body AND content-length: 0. Collapsing
+    // empty -> None here would drop both (buffered) or desync CL (FDS+flag).
+    let body = Some(state.request_body.as_slice());
     Ok(build_request_for_phase(
         phase,
-        mutation,
-        body_data_if_present(&state.request_body),
+        with_content_length(mutation, body, original_len),
+        body,
         state.protocol_config.request_body_mode,
     ))
 }
@@ -573,6 +578,7 @@ async fn run_response_pipeline(
     let original_headers = capture_original_headers(&resp);
     ctx.response_header = Some(&mut resp);
 
+    let original_len = state.response_body.len();
     if let Some(rejection) = execute_response_pipeline_and_body_filters(
         phase,
         pipeline,
@@ -595,10 +601,14 @@ async fn run_response_pipeline(
         },
     };
 
+    // Emit the authoritative buffer even when empty: a filter that cleared the
+    // body must produce an explicit empty body AND content-length: 0. Collapsing
+    // empty -> None here would drop both (buffered) or desync CL (FDS+flag).
+    let body = Some(state.response_body.as_slice());
     Ok(build_response_for_phase(
         phase,
-        mutation,
-        body_data_if_present(&state.response_body),
+        with_content_length(mutation, body, original_len),
+        body,
         state.protocol_config.response_body_mode,
     ))
 }
@@ -627,6 +637,24 @@ async fn execute_response_pipeline_and_body_filters(
 
     let body_reject = run_resp_body_filters(pipeline, ctx, response_body, true)?;
     Ok(body_reject)
+}
+
+/// Set `content-length` when the emitted body differs in size from the original.
+///
+/// Keeps the declared length in sync with the bytes actually emitted to Envoy,
+/// including 0 when a filter clears the body. Left untouched only when the size
+/// is unchanged. Honored by Envoy in `BUFFERED` and in `FULL_DUPLEX_STREAMED` with
+/// `allow_content_length_header`; ignored (harmlessly) in `STREAMED`, where Envoy
+/// strips content-length and switches to chunked encoding.
+fn with_content_length(
+    mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    body: Option<&[u8]>,
+    original_len: usize,
+) -> Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation> {
+    match body {
+        Some(b) if b.len() != original_len => Some(adapter::set_content_length(mutation, b.len())),
+        _ => mutation,
+    }
 }
 
 /// Build request-phase responses, prepending `HeadersResponse` in FDS mode.
@@ -1370,5 +1398,63 @@ mod tests {
                 err.message()
             );
         }
+    }
+
+    /// Read the `content-length` value from a header mutation, if present.
+    fn content_length_of(
+        mutation: &Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    ) -> Option<String> {
+        mutation.as_ref()?.set_headers.iter().find_map(|h| {
+            let hv = h.header.as_ref()?;
+            hv.key.eq_ignore_ascii_case("content-length").then(|| hv.value.clone())
+        })
+    }
+
+    #[test]
+    fn with_content_length_sets_on_resize() {
+        let mutation = with_content_length(None, Some(b"shorter"), 100);
+        assert_eq!(
+            content_length_of(&mutation).as_deref(),
+            Some("7"),
+            "should declare new length"
+        );
+    }
+
+    #[test]
+    fn with_content_length_sets_on_shrink() {
+        // A non-empty emitted body shrunk from a larger original.
+        let mutation = with_content_length(None, Some(b"x"), 50);
+        assert_eq!(content_length_of(&mutation).as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn with_content_length_noop_when_unchanged() {
+        let mutation = with_content_length(None, Some(b"same"), 4);
+        assert!(
+            content_length_of(&mutation).is_none(),
+            "unchanged size needs no correction"
+        );
+    }
+
+    #[test]
+    fn with_content_length_noop_without_body() {
+        let mutation = with_content_length(None, None, 0);
+        assert!(mutation.is_none(), "no emitted body means no content-length change");
+    }
+
+    /// Clearing a previously non-empty body must declare `content-length: 0`.
+    ///
+    /// The pipeline tails now pass the authoritative buffer as `Some` even when
+    /// empty, so `with_content_length` sees emitted len 0 != original and emits
+    /// the correction. Skipping it would leave a stale length against an empty
+    /// body -- a request-smuggling vector under FDS `allow_content_length_header`.
+    #[test]
+    fn with_content_length_corrects_when_body_cleared() {
+        let mutation = with_content_length(None, Some(b""), 100);
+        assert_eq!(
+            content_length_of(&mutation).as_deref(),
+            Some("0"),
+            "clearing the body must declare content-length: 0"
+        );
     }
 }

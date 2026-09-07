@@ -226,8 +226,9 @@ fn body_responses(
     match body_mode {
         BodyMode::FullDuplexStreamed => body_responses_streamed(body, mutation, is_request, end_of_stream),
         BodyMode::None | BodyMode::Streamed | BodyMode::Buffered | BodyMode::BufferedPartial => {
-            // BUFFERED mode (and others): use BodyMutation::Body for full replacement
-            let body_mutation = body.filter(|b| !b.is_empty()).map(make_body_mutation);
+            // BUFFERED mode (and others): use BodyMutation::Body for full replacement.
+            // `Some(&[])` is an explicit clear (emit empty body); `None` = leave as-is.
+            let body_mutation = body.map(make_body_mutation);
 
             let common = CommonResponse {
                 status: ResponseStatus::Continue.into(),
@@ -560,11 +561,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_body_has_no_body_mutation() {
+    fn empty_body_emits_explicit_clear() {
+        // `Some(&[])` is an intentional clear: emit an empty BodyMutation::Body
+        // so Envoy replaces the body with zero bytes (vs `None` = leave as-is).
         let responses = request_body(Some(&[]), None, BodyMode::Buffered, true);
 
         let body_mut = extract_body_mutation(&responses[0]);
-        assert!(body_mut.is_none(), "empty body should not produce body_mutation");
+        match body_mut {
+            Some(body_mutation::Mutation::Body(bytes)) => {
+                assert!(bytes.is_empty(), "cleared body must emit zero bytes");
+            },
+            other => panic!("expected empty Body variant, got {other:?}"),
+        }
     }
 
     #[test]
