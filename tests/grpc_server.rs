@@ -789,6 +789,73 @@ async fn duplicate_eos_in_response_body_rejected() {
     );
 }
 
+/// Regression for #58: in `FULL_DUPLEX_STREAMED`, Envoy re-delivers the final
+/// body chunk after `end_of_stream` (observed with >1MB bodies on Envoy 1.35+).
+/// The re-delivery must be a no-op that keeps the stream usable, not an error.
+#[tokio::test]
+async fn duplicate_eos_in_fds_request_body_ignored() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/upload", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 4, // FULL_DUPLEX_STREAMED
+        response_body_mode: 2,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.unwrap();
+
+    let body_data = vec![0_u8; 1024];
+    let final_chunk = ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: body_data.clone(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    };
+    tx.send(final_chunk.clone()).await.unwrap();
+
+    // Header response, then the streamed body response for the first EOS chunk.
+    let hdr_msg = response_stream.message().await.unwrap();
+    assert!(
+        matches!(hdr_msg.and_then(|m| m.response), Some(RespVariant::RequestHeaders(_))),
+        "first response should be HeadersResponse"
+    );
+    let body_msg = response_stream.message().await.unwrap();
+    assert!(
+        matches!(body_msg.and_then(|m| m.response), Some(RespVariant::RequestBody(_))),
+        "second response should be the streamed body response"
+    );
+
+    // Re-deliver the final chunk, then close the request stream.
+    tx.send(final_chunk).await.unwrap();
+    drop(tx);
+
+    // The duplicate is a no-op: the stream stays healthy and closes cleanly
+    // (Ok) with no ImmediateResponse — never an error tearing it down.
+    loop {
+        let next = tokio::time::timeout(
+            std::time::Duration::from_millis(TIMEOUT_MILLIS),
+            response_stream.message(),
+        )
+        .await
+        .expect("timed out waiting for stream to drain")
+        .expect("duplicate FDS end-of-stream chunk must not error the stream");
+
+        match next {
+            None => break,
+            Some(msg) => assert!(
+                !matches!(&msg.response, Some(RespVariant::ImmediateResponse(_))),
+                "duplicate chunk must not produce an ImmediateResponse, got: {msg:?}"
+            ),
+        }
+    }
+}
+
 #[tokio::test]
 async fn repro_ap_post_eos_body() {
     let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;

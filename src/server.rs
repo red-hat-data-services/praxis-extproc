@@ -255,95 +255,128 @@ enum ProtocolPhase {
     ResponseBody,
 }
 
-/// EOS marker state for a single phase.
-#[derive(Debug, Default, Copy, Clone)]
-enum EosMarker {
-    /// No EOS received yet.
+/// End-of-stream lifecycle state of a single protocol phase.
+///
+/// Doubles as the outcome of [`EosTracker::check_and_mark`], which returns the
+/// phase's state *on entry*: [`PhaseState::Completed`] means `end_of_stream` was
+/// already seen, so the current message is a re-delivery.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+enum PhaseState {
+    /// No `end_of_stream` seen yet; the phase is still being processed.
     #[default]
-    NotReceived,
-    /// EOS has been received.
-    Received,
+    Active,
+    /// `end_of_stream` received; the phase is complete.
+    Completed,
 }
 
-impl EosMarker {
-    /// Check if EOS was already received.
-    const fn is_received(self) -> bool {
-        matches!(self, Self::Received)
-    }
-
-    /// Mark as received.
-    fn mark_received(&mut self) {
-        *self = Self::Received;
+impl PhaseState {
+    /// Whether the phase has completed (`end_of_stream` seen).
+    const fn is_complete(self) -> bool {
+        matches!(self, Self::Completed)
     }
 }
 
 /// Tracks end-of-stream status for each protocol phase.
 #[derive(Debug, Default)]
 struct EosTracker {
-    /// Request headers EOS marker.
-    request_headers: EosMarker,
-    /// Request body EOS marker.
-    request_body: EosMarker,
-    /// Response headers EOS marker.
-    response_headers: EosMarker,
-    /// Response body EOS marker.
-    response_body: EosMarker,
+    /// Request headers phase state.
+    request_headers: PhaseState,
+    /// Request body phase state.
+    request_body: PhaseState,
+    /// Response headers phase state.
+    response_headers: PhaseState,
+    /// Response body phase state.
+    response_body: PhaseState,
 }
 
 impl EosTracker {
-    /// Check if a phase has received EOS.
-    fn phase_is_received(&self, phase: ProtocolPhase) -> bool {
+    /// Current state of a phase.
+    fn phase_state(&self, phase: ProtocolPhase) -> PhaseState {
         match phase {
-            ProtocolPhase::RequestHeaders => self.request_headers.is_received(),
-            ProtocolPhase::RequestBody => self.request_body.is_received(),
-            ProtocolPhase::ResponseHeaders => self.response_headers.is_received(),
-            ProtocolPhase::ResponseBody => self.response_body.is_received(),
+            ProtocolPhase::RequestHeaders => self.request_headers,
+            ProtocolPhase::RequestBody => self.request_body,
+            ProtocolPhase::ResponseHeaders => self.response_headers,
+            ProtocolPhase::ResponseBody => self.response_body,
         }
     }
 
-    /// Validate and mark end-of-stream for a protocol phase.
+    /// Detect re-delivery and mark end-of-stream for a protocol phase.
+    ///
+    /// Returns the phase's state *on entry*: [`PhaseState::Completed`] means the
+    /// message is a re-delivery, leaving the benign-vs-violation policy to the
+    /// caller (which knows the body mode). A message on a body phase whose headers
+    /// phase already ended is always a genuine sequencing violation, rejected here.
     ///
     /// # Errors
     ///
-    /// Returns [`Status::invalid_argument`] if any message is received after EOS.
-    fn check_and_mark(&mut self, phase: ProtocolPhase, received_eos: bool) -> Result<(), Status> {
-        // Check if this phase already received EOS
-        if self.phase_is_received(phase) {
-            return Err(Status::invalid_argument(format!(
-                "received {phase:?} message after end_of_stream was already marked"
-            )));
+    /// Returns [`Status::invalid_argument`] if a body message arrives after its
+    /// headers phase has ended.
+    fn check_and_mark(&mut self, phase: ProtocolPhase, received_eos: bool) -> Result<PhaseState, Status> {
+        // An already-completed phase means this message is a re-delivery; the
+        // caller decides whether that is benign (FDS) or a violation.
+        if self.phase_state(phase).is_complete() {
+            return Ok(PhaseState::Completed);
         }
 
-        // For body phases: check if the corresponding headers phase has ended
-        let headers_ended = match phase {
-            ProtocolPhase::RequestBody => self.phase_is_received(ProtocolPhase::RequestHeaders),
-            ProtocolPhase::ResponseBody => self.phase_is_received(ProtocolPhase::ResponseHeaders),
+        // For body phases: a message after the corresponding headers phase ended
+        // is a genuine sequencing violation regardless of mode.
+        let headers_completed = match phase {
+            ProtocolPhase::RequestBody => self.request_headers.is_complete(),
+            ProtocolPhase::ResponseBody => self.response_headers.is_complete(),
             ProtocolPhase::RequestHeaders | ProtocolPhase::ResponseHeaders => false,
         };
 
-        if headers_ended {
+        if headers_completed {
             return Err(Status::invalid_argument(format!(
                 "received {phase:?} message after headers end_of_stream was already marked"
             )));
         }
 
-        // Mark received if needed
         if received_eos {
             match phase {
-                ProtocolPhase::RequestHeaders => self.request_headers.mark_received(),
-                ProtocolPhase::RequestBody => self.request_body.mark_received(),
-                ProtocolPhase::ResponseHeaders => self.response_headers.mark_received(),
-                ProtocolPhase::ResponseBody => self.response_body.mark_received(),
+                ProtocolPhase::RequestHeaders => self.request_headers = PhaseState::Completed,
+                ProtocolPhase::RequestBody => self.request_body = PhaseState::Completed,
+                ProtocolPhase::ResponseHeaders => self.response_headers = PhaseState::Completed,
+                ProtocolPhase::ResponseBody => self.response_body = PhaseState::Completed,
             }
         }
 
-        Ok(())
+        Ok(PhaseState::Active)
     }
 }
 
 // -----------------------------------------------------------------------------
 // Phase Handlers
 // -----------------------------------------------------------------------------
+
+/// Error for a message re-delivered after its phase already completed.
+fn duplicate_after_eos(phase: ProtocolPhase) -> Status {
+    Status::invalid_argument(format!(
+        "received {phase:?} message after end_of_stream was already marked"
+    ))
+}
+
+/// Apply body-phase policy to the phase state observed by [`EosTracker::check_and_mark`].
+///
+/// Returns `Ok(None)` to keep processing. For a re-delivery ([`PhaseState::Completed`]),
+/// `FULL_DUPLEX_STREAMED` is the only mode where Envoy benignly re-sends the final
+/// chunk (>1MB bodies, Envoy 1.35+), so it becomes an ignored no-op (`Ok(Some(empty))`);
+/// any other mode never re-delivers, so a duplicate is rejected.
+fn handle_body_redelivery(
+    entry_state: PhaseState,
+    mode: BodyMode,
+    phase: ProtocolPhase,
+    bytes: usize,
+) -> Result<Option<Vec<ProcessingResponse>>, Status> {
+    match entry_state {
+        PhaseState::Active => Ok(None),
+        PhaseState::Completed if mode == BodyMode::FullDuplexStreamed => {
+            debug!(?phase, bytes, "ignoring re-delivered FDS body end-of-stream chunk");
+            Ok(Some(Vec::new()))
+        },
+        PhaseState::Completed => Err(duplicate_after_eos(phase)),
+    }
+}
 
 /// Handle request headers: parse into [`Request`] and route by body mode.
 ///
@@ -358,9 +391,14 @@ async fn handle_request_headers(
     headers: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    state
+    if state
         .eos_tracker
-        .check_and_mark(ProtocolPhase::RequestHeaders, headers.end_of_stream)?;
+        .check_and_mark(ProtocolPhase::RequestHeaders, headers.end_of_stream)?
+        == PhaseState::Completed
+    {
+        // Envoy does not re-deliver headers; a duplicate is a protocol violation.
+        return Err(duplicate_after_eos(ProtocolPhase::RequestHeaders));
+    }
 
     let envoy_headers = extract_header_list(&headers);
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
@@ -388,11 +426,19 @@ async fn handle_request_body(
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    state
-        .eos_tracker
-        .check_and_mark(ProtocolPhase::RequestBody, body.end_of_stream)?;
-
     let mode = state.protocol_config.request_body_mode;
+
+    if let Some(response) = handle_body_redelivery(
+        state
+            .eos_tracker
+            .check_and_mark(ProtocolPhase::RequestBody, body.end_of_stream)?,
+        mode,
+        ProtocolPhase::RequestBody,
+        body.body.len(),
+    )? {
+        return Ok(response);
+    }
+
     let needs_body = pipeline.body_capabilities().needs_request_body;
 
     match (mode, needs_body) {
@@ -431,9 +477,14 @@ async fn handle_response_headers(
     headers: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    state
+    if state
         .eos_tracker
-        .check_and_mark(ProtocolPhase::ResponseHeaders, headers.end_of_stream)?;
+        .check_and_mark(ProtocolPhase::ResponseHeaders, headers.end_of_stream)?
+        == PhaseState::Completed
+    {
+        // Envoy does not re-deliver headers; a duplicate is a protocol violation.
+        return Err(duplicate_after_eos(ProtocolPhase::ResponseHeaders));
+    }
 
     let envoy_headers = extract_header_list(&headers);
     state.response = Some(adapter::envoy_headers_to_response(&envoy_headers));
@@ -461,11 +512,19 @@ async fn handle_response_body(
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    state
-        .eos_tracker
-        .check_and_mark(ProtocolPhase::ResponseBody, body.end_of_stream)?;
-
     let mode = state.protocol_config.response_body_mode;
+
+    if let Some(response) = handle_body_redelivery(
+        state
+            .eos_tracker
+            .check_and_mark(ProtocolPhase::ResponseBody, body.end_of_stream)?,
+        mode,
+        ProtocolPhase::ResponseBody,
+        body.body.len(),
+    )? {
+        return Ok(response);
+    }
+
     let needs_body = pipeline.body_capabilities().needs_response_body;
 
     match (mode, needs_body) {
@@ -1152,41 +1211,30 @@ fn merge_mutations(
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 
     #[test]
-    fn eos_marker_default_is_not_received() {
-        let marker = EosMarker::default();
-        assert!(!marker.is_received(), "default marker should not be received");
+    fn phase_state_default_is_active() {
+        let state = PhaseState::default();
+        assert_eq!(state, PhaseState::Active, "default phase state should be Active");
+        assert!(!state.is_complete(), "default phase state should not be complete");
     }
 
     #[test]
-    fn eos_marker_mark_received_sets_received() {
-        let mut marker = EosMarker::default();
-        marker.mark_received();
-        assert!(marker.is_received(), "marker should be received after marking");
-    }
-
-    #[test]
-    fn eos_tracker_default_all_not_received() {
+    fn eos_tracker_default_all_active() {
         let tracker = EosTracker::default();
         assert!(
-            !tracker.request_headers.is_received(),
-            "request_headers should not be received"
+            !tracker.request_headers.is_complete(),
+            "request_headers should be Active"
         );
+        assert!(!tracker.request_body.is_complete(), "request_body should be Active");
         assert!(
-            !tracker.request_body.is_received(),
-            "request_body should not be received"
+            !tracker.response_headers.is_complete(),
+            "response_headers should be Active"
         );
-        assert!(
-            !tracker.response_headers.is_received(),
-            "response_headers should not be received"
-        );
-        assert!(
-            !tracker.response_body.is_received(),
-            "response_body should not be received"
-        );
+        assert!(!tracker.response_body.is_complete(), "response_body should be Active");
     }
 
     #[test]
@@ -1217,27 +1265,27 @@ mod tests {
     }
 
     #[test]
-    fn eos_tracker_duplicate_eos_fails() {
+    fn eos_tracker_duplicate_eos_reports_duplicate() {
         let mut tracker = EosTracker::default();
 
-        // Mark first EOS
-        assert!(tracker.check_and_mark(ProtocolPhase::RequestHeaders, true).is_ok());
+        // First EOS is a fresh message to process.
+        assert_eq!(
+            tracker.check_and_mark(ProtocolPhase::RequestHeaders, true).unwrap(),
+            PhaseState::Active
+        );
 
-        // Any subsequent message should fail
-        let result = tracker.check_and_mark(ProtocolPhase::RequestHeaders, true);
-        assert!(result.is_err(), "message after EOS should fail");
-
-        if let Err(err) = result {
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(err.message().contains("after end_of_stream"));
-            assert!(err.message().contains("RequestHeaders"));
-        }
+        // Re-delivery is reported as Completed (policy is left to the caller).
+        assert_eq!(
+            tracker.check_and_mark(ProtocolPhase::RequestHeaders, true).unwrap(),
+            PhaseState::Completed,
+            "re-delivery should report Completed"
+        );
     }
 
     #[test]
-    fn eos_tracker_duplicate_eos_in_each_phase_fails() {
-        // Test message-after-EOS detection in each phase independently
-        // Use separate trackers since body phases are blocked after header EOS
+    fn eos_tracker_duplicate_eos_in_each_phase_reports_duplicate() {
+        // Test re-delivery detection in each phase independently.
+        // Use separate trackers since body phases are blocked after header EOS.
         let phases = [
             ProtocolPhase::RequestHeaders,
             ProtocolPhase::RequestBody,
@@ -1248,25 +1296,17 @@ mod tests {
         for phase in phases {
             let mut tracker = EosTracker::default();
 
-            assert!(
-                tracker.check_and_mark(phase, true).is_ok(),
-                "first EOS should succeed for {phase:?}"
+            assert_eq!(
+                tracker.check_and_mark(phase, true).unwrap(),
+                PhaseState::Active,
+                "first EOS should be Active for {phase:?}"
             );
 
-            let result = tracker.check_and_mark(phase, true);
-            assert!(result.is_err(), "message after EOS should fail for {phase:?}");
-
-            if let Err(err) = result {
-                assert_eq!(
-                    err.code(),
-                    tonic::Code::InvalidArgument,
-                    "error code should be InvalidArgument for {phase:?}"
-                );
-                assert!(
-                    err.message().contains("after end_of_stream"),
-                    "error message should mention 'after end_of_stream' for {phase:?}"
-                );
-            }
+            assert_eq!(
+                tracker.check_and_mark(phase, true).unwrap(),
+                PhaseState::Completed,
+                "re-delivery should report Completed for {phase:?}"
+            );
         }
     }
 
@@ -1276,11 +1316,11 @@ mod tests {
 
         // Calling with received_eos=false should be a no-op
         assert!(tracker.check_and_mark(ProtocolPhase::RequestHeaders, false).is_ok());
-        assert!(!tracker.request_headers.is_received(), "marker should stay NotReceived");
+        assert!(!tracker.request_headers.is_complete(), "phase should stay Active");
 
         // Can still mark it later
         assert!(tracker.check_and_mark(ProtocolPhase::RequestHeaders, true).is_ok());
-        assert!(tracker.request_headers.is_received(), "marker should now be Received");
+        assert!(tracker.request_headers.is_complete(), "phase should now be Completed");
     }
 
     #[test]
@@ -1319,37 +1359,30 @@ mod tests {
         // Multiple false calls should all be no-ops
         for _ in 0..5 {
             assert!(tracker.check_and_mark(ProtocolPhase::RequestBody, false).is_ok());
-            assert!(!tracker.request_body.is_received());
+            assert!(!tracker.request_body.is_complete());
         }
 
         // First true should succeed
         assert!(tracker.check_and_mark(ProtocolPhase::RequestBody, true).is_ok());
-        assert!(tracker.request_body.is_received());
+        assert!(tracker.request_body.is_complete());
 
-        // Subsequent message (even with false) should fail
-        let result = tracker.check_and_mark(ProtocolPhase::RequestBody, false);
-        assert!(
-            result.is_err(),
-            "message after EOS should fail even with end_of_stream=false"
+        // Subsequent message (even with false) is a re-delivery.
+        assert_eq!(
+            tracker.check_and_mark(ProtocolPhase::RequestBody, false).unwrap(),
+            PhaseState::Completed,
+            "re-delivery should report Completed even with end_of_stream=false"
         );
 
-        if let Err(err) = result {
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        }
-
-        // Subsequent true should also fail
-        let result = tracker.check_and_mark(ProtocolPhase::RequestBody, true);
-        assert!(result.is_err(), "message after EOS should fail");
-
-        if let Err(err) = result {
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        }
+        // Subsequent true is also a re-delivery.
+        assert_eq!(
+            tracker.check_and_mark(ProtocolPhase::RequestBody, true).unwrap(),
+            PhaseState::Completed,
+            "re-delivery should report Completed"
+        );
     }
 
     #[test]
-    fn eos_tracker_error_message_includes_phase() {
-        // Mark each phase and verify error message includes phase name
-        // Use separate trackers since body phases are blocked after header EOS
+    fn duplicate_after_eos_error_includes_phase() {
         let test_cases = [
             (ProtocolPhase::RequestHeaders, "RequestHeaders"),
             (ProtocolPhase::RequestBody, "RequestBody"),
@@ -1358,45 +1391,64 @@ mod tests {
         ];
 
         for (phase, expected_name) in test_cases {
-            let mut tracker = EosTracker::default();
-            assert!(tracker.check_and_mark(phase, true).is_ok(), "first EOS should succeed");
-
-            let result = tracker.check_and_mark(phase, true);
-            assert!(result.is_err(), "message after EOS should fail");
-
-            if let Err(err) = result {
-                assert!(
-                    err.message().contains(expected_name),
-                    "error for {:?} should contain '{}', got: {}",
-                    phase,
-                    expected_name,
-                    err.message()
-                );
-            }
+            let err = duplicate_after_eos(phase);
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(
+                err.message().contains("after end_of_stream"),
+                "error for {phase:?} should mention 'after end_of_stream', got: {}",
+                err.message()
+            );
+            assert!(
+                err.message().contains(expected_name),
+                "error for {phase:?} should contain '{expected_name}', got: {}",
+                err.message()
+            );
         }
     }
 
     #[test]
-    fn eos_tracker_rejects_message_after_eos_regardless_of_flag() {
+    fn eos_tracker_reports_duplicate_regardless_of_flag() {
         let mut tracker = EosTracker::default();
 
         // Mark EOS
         assert!(tracker.check_and_mark(ProtocolPhase::RequestBody, true).is_ok());
 
-        // Subsequent message with end_of_stream=false should also fail
-        let result = tracker.check_and_mark(ProtocolPhase::RequestBody, false);
+        // A re-delivery is reported as Completed whatever the end_of_stream flag.
+        assert_eq!(
+            tracker.check_and_mark(ProtocolPhase::RequestBody, false).unwrap(),
+            PhaseState::Completed
+        );
+        assert_eq!(
+            tracker.check_and_mark(ProtocolPhase::RequestBody, true).unwrap(),
+            PhaseState::Completed
+        );
+    }
+
+    #[test]
+    fn handle_body_redelivery_ignores_only_fds_duplicates() {
+        let fds = BodyMode::FullDuplexStreamed;
+        let phase = ProtocolPhase::RequestBody;
+
+        // A fresh message always proceeds.
+        let proceed = handle_body_redelivery(PhaseState::Active, fds, phase, 10).unwrap();
+        assert!(proceed.is_none());
+
+        // FDS re-delivery: benign no-op (empty response set).
+        let noop = handle_body_redelivery(PhaseState::Completed, fds, phase, 10).unwrap();
         assert!(
-            result.is_err(),
-            "message with end_of_stream=false after EOS should fail"
+            noop.is_some_and(|r| r.is_empty()),
+            "FDS re-delivery should be an empty no-op"
         );
 
-        if let Err(err) = result {
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(
-                err.message().contains("after end_of_stream"),
-                "error should indicate message after EOS, got: {}",
-                err.message()
+        // Other modes never re-deliver: a duplicate is a rejected violation.
+        for mode in [BodyMode::Streamed, BodyMode::Buffered] {
+            let err = handle_body_redelivery(PhaseState::Completed, mode, phase, 10).unwrap_err();
+            assert_eq!(
+                err.code(),
+                tonic::Code::InvalidArgument,
+                "duplicate in {mode:?} should be rejected"
             );
+            assert!(err.message().contains("after end_of_stream"));
         }
     }
 
