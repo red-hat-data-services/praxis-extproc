@@ -13,7 +13,7 @@
 # Builder
 # ---------------------------------------------------------------------------
 
-FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:25a147defd01e19674714f55d17538c8dbe55d8c305fa157ecc3f9c8977b05b6 AS builder
+FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:206b65b8ee0f04b992818c9a51b29081b14974630d4850bc358097d0c44ea156 AS builder
 
 ARG CARGO_PROFILE=release
 
@@ -44,7 +44,7 @@ RUN set -eu; \
 # Runtime
 # ---------------------------------------------------------------------------
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:6aa59f704742d12328aa43379048f951c052dfb684c22b79080baf34c1f92368
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:d235f607e1d6d833f031db107dc42206e4dd4d5aa9142c43d3771fb7f9bea76a
 
 RUN microdnf install -y openssl-libs \
     && microdnf clean all
