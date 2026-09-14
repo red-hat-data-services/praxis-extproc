@@ -175,13 +175,27 @@ the ExtProc protocol.
 
 ### Metrics
 
-Three metrics are exported:
+Five metrics are exported:
 
-| Metric | Type | Description |
-| --- | --- | --- |
-| `praxis_extproc_requests_total` | counter | Total ExtProc streams |
-| `praxis_extproc_immediate_responses_total` | counter | Rejection count |
-| `praxis_extproc_request_duration_seconds` | histogram | Per-stream duration |
+| Metric                                      | Type      | Description                                                      |
+|---------------------------------------------|-----------|------------------------------------------------------------------|
+| `praxis_extproc_requests_total`             | counter   | Total ExtProc streams                                            |
+| `praxis_extproc_immediate_responses_total`  | counter   | Rejection count                                                  |
+| `praxis_extproc_request_duration_seconds`   | histogram | Per-stream duration                                              |
+| `praxis_extproc_body_size_rejections_total` | counter   | Requests rejected for exceeding max body accumulation            |
+| `praxis_extproc_invalid_argument_total`     | counter   | `invalid_argument` rejections, labelled by `reason` and `detail` |
+
+
+The `praxis_extproc_invalid_argument_total` counter carries bounded
+`reason`/`detail` labels:
+
+
+| reason            | detail                                                                                  |
+|-------------------|-----------------------------------------------------------------------------------------|
+| `protocol_config` | `after_first_message`, `unsupported_mode`                                               |
+| `message_order`   | `response_before_request_headers`, `invalid_phase_transition`, `body_after_headers_eos` |
+| `duplicate_eos`   | `redelivery`                                                                            |
+| `missing_headers` | `request`, `response`                                                                   |
 
 ## TLS
 

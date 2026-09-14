@@ -171,14 +171,7 @@ async fn process_messages(
     while let Some(result) = inbound.next().await {
         let msg = result.map_err(|e| Status::internal(e.to_string()))?;
 
-        if let Some(proto_cfg) = msg.protocol_config {
-            if first_message_processed {
-                return Err(Status::invalid_argument(
-                    "protocol_config may only be sent on the first stream message",
-                ));
-            }
-            config_from_first_message(stream_state, proto_cfg)?;
-        }
+        apply_protocol_config(stream_state, msg.protocol_config, first_message_processed)?;
         first_message_processed = true;
 
         let Some(req) = msg.request else {
@@ -203,13 +196,39 @@ async fn process_messages(
     Ok(())
 }
 
+/// Apply a first-message `protocol_config`, rejecting late deliveries.
+///
+/// # Errors
+///
+/// Returns [`Status::invalid_argument`] if `protocol_config` arrives after the
+/// first message, or if it requests an unsupported body mode.
+fn apply_protocol_config(
+    stream_state: &mut StreamState,
+    proto_cfg: Option<ProtocolConfiguration>,
+    first_message_processed: bool,
+) -> Result<(), Status> {
+    let Some(proto_cfg) = proto_cfg else {
+        return Ok(());
+    };
+    if first_message_processed {
+        metrics::record_invalid_argument("protocol_config", "after_first_message");
+        return Err(Status::invalid_argument(
+            "protocol_config may only be sent on the first stream message",
+        ));
+    }
+    config_from_first_message(stream_state, proto_cfg)
+}
+
 /// Parses `protocol_config` from first message.
 ///
 /// # Errors
 ///
 /// Returns [`Status::invalid_argument`] if unsupported body modes are requested.
 fn config_from_first_message(stream_state: &mut StreamState, proto_cfg: ProtocolConfiguration) -> Result<(), Status> {
-    stream_state.protocol_config = ProtocolConfig::try_from(proto_cfg).map_err(Status::invalid_argument)?;
+    stream_state.protocol_config = ProtocolConfig::try_from(proto_cfg).map_err(|m| {
+        metrics::record_invalid_argument("protocol_config", "unsupported_mode");
+        Status::invalid_argument(m)
+    })?;
     debug!(
         request_mode = ?stream_state.protocol_config.request_body_mode,
         response_mode = ?stream_state.protocol_config.response_body_mode,
@@ -289,6 +308,7 @@ impl PhaseOrderTracker {
             PhaseSide::Request => &mut self.request,
             PhaseSide::Response => {
                 if !self.request_headers_seen {
+                    metrics::record_invalid_argument("message_order", "response_before_request_headers");
                     return Err(Status::invalid_argument(format!(
                         "out-of-order ExtProc message: {} arrived before request headers",
                         request_type_label(req)
@@ -303,6 +323,7 @@ impl PhaseOrderTracker {
         };
 
         if invalid_transition {
+            metrics::record_invalid_argument("message_order", "invalid_phase_transition");
             return Err(Status::invalid_argument(format!(
                 "out-of-order ExtProc message: invalid {side:?} phase transition to {}",
                 request_type_label(req)
@@ -428,6 +449,7 @@ impl EosTracker {
         };
 
         if headers_completed {
+            metrics::record_invalid_argument("message_order", "body_after_headers_eos");
             return Err(Status::invalid_argument(format!(
                 "received {phase:?} message after headers end_of_stream was already marked"
             )));
@@ -452,6 +474,7 @@ impl EosTracker {
 
 /// Error for a message re-delivered after its phase already completed.
 fn duplicate_after_eos(phase: ProtocolPhase) -> Status {
+    metrics::record_invalid_argument("duplicate_eos", "redelivery");
     Status::invalid_argument(format!(
         "received {phase:?} message after end_of_stream was already marked"
     ))
@@ -673,6 +696,7 @@ async fn run_request_pipeline(
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
+        metrics::record_invalid_argument("missing_headers", "request");
         return Err(Status::invalid_argument("request headers not received"));
     };
     let mut ctx = adapter::build_filter_context(pipeline, request);
@@ -725,13 +749,14 @@ async fn run_response_pipeline(
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
+        metrics::record_invalid_argument("missing_headers", "request");
         return Err(Status::invalid_argument("request headers not received"));
     };
 
-    let mut resp = state
-        .response
-        .take()
-        .ok_or_else(|| Status::invalid_argument("response headers not received"))?;
+    let mut resp = state.response.take().ok_or_else(|| {
+        metrics::record_invalid_argument("missing_headers", "response");
+        Status::invalid_argument("response headers not received")
+    })?;
 
     let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
@@ -914,17 +939,17 @@ async fn process_streamed_body_chunk(
     state: &mut StreamState,
     is_request: bool,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    let request = state
-        .request
-        .as_ref()
-        .ok_or_else(|| Status::invalid_argument("request headers not received"))?;
+    let request = state.request.as_ref().ok_or_else(|| {
+        metrics::record_invalid_argument("missing_headers", "request");
+        Status::invalid_argument("request headers not received")
+    })?;
     let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
     if !is_request {
-        let resp = state
-            .response
-            .as_mut()
-            .ok_or_else(|| Status::invalid_argument("response headers not received"))?;
+        let resp = state.response.as_mut().ok_or_else(|| {
+            metrics::record_invalid_argument("missing_headers", "response");
+            Status::invalid_argument("response headers not received")
+        })?;
         ctx.response_header = Some(resp);
     }
     let eos = body.end_of_stream;
@@ -1270,6 +1295,7 @@ fn extract_header_list(headers: &praxis_proto::envoy::service::ext_proc::v3::Htt
 /// Reject body accumulation exceeding [`MAX_BODY_ACCUMULATION`].
 fn check_body_limit(current: usize, incoming: usize) -> Result<(), Status> {
     if current + incoming > MAX_BODY_ACCUMULATION {
+        metrics::record_body_size_rejection();
         return Err(Status::resource_exhausted("body exceeds maximum size"));
     }
     Ok(())
@@ -1751,5 +1777,209 @@ mod tests {
             Some("0"),
             "clearing the body must declare content-length: 0"
         );
+    }
+
+    /// Value of the counter `name` carrying every `labels` pair (0 if absent).
+    fn snapshot_counter(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> u64 {
+        use metrics_util::debugging::DebugValue;
+
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(composite, _unit, _desc, value)| {
+                let key = composite.key();
+                let matches = key.name() == name
+                    && labels
+                        .iter()
+                        .all(|(k, v)| key.labels().any(|l| l.key() == *k && l.value() == *v));
+                match value {
+                    DebugValue::Counter(count) if matches => Some(count),
+                    _ => None,
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    /// Run sync `f` under a thread-local recorder and read back counter `name`/`labels`.
+    fn counter_value(name: &str, labels: &[(&str, &str)], f: impl FnOnce()) -> u64 {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        {
+            // `::metrics` disambiguates the external crate from this crate's `metrics` module.
+            let _guard = ::metrics::set_default_local_recorder(&recorder);
+            f();
+        }
+        snapshot_counter(&snapshotter, name, labels)
+    }
+
+    /// Count `invalid_argument_total` increments matching `reason`/`detail` while `f` runs.
+    fn invalid_arg_count(reason: &str, detail: &str, f: impl FnOnce()) -> u64 {
+        counter_value(
+            "praxis_extproc_invalid_argument_total",
+            &[("reason", reason), ("detail", detail)],
+            f,
+        )
+    }
+
+    #[test]
+    fn apply_protocol_config_after_first_message_records_metric() {
+        let mut state = StreamState::new();
+        let count = invalid_arg_count("protocol_config", "after_first_message", || {
+            let result = apply_protocol_config(&mut state, Some(ProtocolConfiguration::default()), true);
+            assert!(
+                matches!(&result, Err(status) if status.code() == tonic::Code::InvalidArgument),
+                "late protocol_config must be rejected with invalid_argument"
+            );
+        });
+        assert_eq!(count, 1, "late delivery must increment after_first_message");
+    }
+
+    #[test]
+    fn config_from_first_message_unsupported_mode_records_metric() {
+        let mut state = StreamState::new();
+        // 3 == BUFFERED_PARTIAL, an unsupported body mode.
+        let bad = ProtocolConfiguration {
+            request_body_mode: 3,
+            ..ProtocolConfiguration::default()
+        };
+        let count = invalid_arg_count("protocol_config", "unsupported_mode", || {
+            assert!(
+                config_from_first_message(&mut state, bad).is_err(),
+                "unsupported mode must be rejected"
+            );
+        });
+        assert_eq!(count, 1, "unsupported mode must increment unsupported_mode");
+    }
+
+    #[test]
+    fn phase_order_response_before_request_headers_records_metric() {
+        use praxis_proto::envoy::service::ext_proc::v3::HttpHeaders;
+        use processing_request::Request;
+
+        let mut tracker = PhaseOrderTracker::default();
+        let count = invalid_arg_count("message_order", "response_before_request_headers", || {
+            assert!(
+                tracker
+                    .check_and_advance(&Request::ResponseHeaders(HttpHeaders::default()))
+                    .is_err(),
+                "response before request headers must be rejected"
+            );
+        });
+        assert_eq!(count, 1, "response-before-request-headers must increment the counter");
+    }
+
+    #[test]
+    fn phase_order_invalid_transition_records_metric() {
+        use praxis_proto::envoy::service::ext_proc::v3::{HttpBody, HttpHeaders, HttpTrailers};
+        use processing_request::Request;
+
+        let mut tracker = PhaseOrderTracker::default();
+        assert!(
+            tracker
+                .check_and_advance(&Request::RequestHeaders(HttpHeaders::default()))
+                .is_ok()
+        );
+        assert!(
+            tracker
+                .check_and_advance(&Request::RequestTrailers(HttpTrailers::default()))
+                .is_ok()
+        );
+
+        let count = invalid_arg_count("message_order", "invalid_phase_transition", || {
+            assert!(
+                tracker
+                    .check_and_advance(&Request::RequestBody(HttpBody::default()))
+                    .is_err(),
+                "RequestBody after RequestTrailers must be rejected"
+            );
+        });
+        assert_eq!(count, 1, "invalid phase transition must increment the counter");
+    }
+
+    #[test]
+    fn eos_body_after_headers_records_metric() {
+        let mut tracker = EosTracker::default();
+        assert!(tracker.check_and_mark(ProtocolPhase::RequestHeaders, true).is_ok());
+
+        let count = invalid_arg_count("message_order", "body_after_headers_eos", || {
+            assert!(
+                tracker.check_and_mark(ProtocolPhase::RequestBody, true).is_err(),
+                "body after headers EOS must be rejected"
+            );
+        });
+        assert_eq!(count, 1, "body-after-headers-eos must increment the counter");
+    }
+
+    #[test]
+    fn duplicate_after_eos_records_metric() {
+        let count = invalid_arg_count("duplicate_eos", "redelivery", || {
+            let err = duplicate_after_eos(ProtocolPhase::RequestBody);
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        });
+        assert_eq!(count, 1, "duplicate-eos redelivery must increment the counter");
+    }
+
+    #[test]
+    fn check_body_limit_rejection_records_metric() {
+        let count = counter_value("praxis_extproc_body_size_rejections_total", &[], || {
+            assert!(
+                check_body_limit(MAX_BODY_ACCUMULATION, 1).is_err(),
+                "exceeding the body limit must be rejected"
+            );
+        });
+        assert_eq!(count, 1, "body-size rejection must increment the counter");
+    }
+
+    #[tokio::test]
+    async fn run_request_pipeline_missing_headers_records_metric() {
+        use praxis_filter::FilterRegistry;
+
+        let pipeline = FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).unwrap();
+        let mut state = StreamState::new();
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        {
+            let _guard = ::metrics::set_default_local_recorder(&recorder);
+            let result = run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state).await;
+            assert!(result.is_err(), "missing request headers must be rejected");
+        }
+        let count = snapshot_counter(
+            &snapshotter,
+            "praxis_extproc_invalid_argument_total",
+            &[("reason", "missing_headers"), ("detail", "request")],
+        );
+        assert_eq!(count, 1, "missing request headers must increment the counter");
+    }
+
+    #[tokio::test]
+    async fn run_response_pipeline_missing_response_headers_records_metric() {
+        use praxis_filter::FilterRegistry;
+
+        let pipeline = FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).unwrap();
+        let mut state = StreamState::new();
+        // Request headers present, response headers absent: isolates the response branch.
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        {
+            let _guard = ::metrics::set_default_local_recorder(&recorder);
+            let result = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state).await;
+            assert!(result.is_err(), "missing response headers must be rejected");
+        }
+        let count = snapshot_counter(
+            &snapshotter,
+            "praxis_extproc_invalid_argument_total",
+            &[("reason", "missing_headers"), ("detail", "response")],
+        );
+        assert_eq!(count, 1, "missing response headers must increment the counter");
     }
 }
