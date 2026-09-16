@@ -13,7 +13,9 @@
 use std::{collections::HashMap, net::IpAddr, time::Instant};
 
 use http::{HeaderMap, Method, StatusCode, Uri};
-use praxis_filter::{BodyMode, FilterPipeline, HttpFilterContext, Request, RequestExtensions, Response};
+use praxis_filter::{
+    BodyMode, FilterPipeline, HttpFilterContext, Request, RequestExtensions, Response, SubRequestResponseMode,
+};
 use praxis_proto::envoy::service::{
     common::v3::{HeaderValue, HeaderValueOption, HttpStatus, header_value_option::HeaderAppendAction},
     ext_proc::v3::{HeaderMutation, ImmediateResponse},
@@ -105,6 +107,7 @@ pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Reque
         health_registry: pipeline.health_registry(),
         id_generator: pipeline.id_generator(),
         kv_stores: pipeline.kv_stores(),
+        session_stores: None,
         subrequest_client: pipeline.subrequest_client(),
         request,
         request_body_bytes: 0,
@@ -114,6 +117,14 @@ pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Reque
         response_body_mode: BodyMode::Stream,
         response_header: None,
         response_headers_modified: false,
+        subrequest_response_mode: SubRequestResponseMode::Buffered,
+        attempted_endpoints: Vec::new(),
+        retry_policy: None,
+        route_retry_policy: None,
+        cluster_retry_state: None,
+        cluster_retry_state_released: false,
+        endpoint_reselector: None,
+        pinned_endpoint_address: None,
         selected_endpoint_index: None,
         time_source: pipeline.time_source(),
         rewritten_path: None,
