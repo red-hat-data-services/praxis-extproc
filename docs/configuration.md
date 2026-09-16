@@ -276,11 +276,13 @@ Working examples in the `examples/` directory:
 | --- | --- |
 | [praxis-extproc.yaml] | Common filters: request ID, access log, guardrails, headers |
 | [ai-model-to-header.yaml] | AI `model_to_header` with request ID and headers |
+| [llmisvc-model-provider-resolver.yaml] | `model_to_header` plus `llmisvc_model_provider_resolver` for KServe routing |
 | [envoy.yaml] | Envoy config wiring up the ExtProc filter |
 | [branch-chains.yaml] | Conditional branching on filter results |
 
 [praxis-extproc.yaml]: ../examples/praxis-extproc.yaml
 [ai-model-to-header.yaml]: ../examples/ai-model-to-header.yaml
+[llmisvc-model-provider-resolver.yaml]: ../examples/llmisvc-model-provider-resolver.yaml
 [envoy.yaml]: ../examples/envoy.yaml
 [branch-chains.yaml]: ../examples/branch-chains.yaml
 
