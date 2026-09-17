@@ -173,6 +173,42 @@ Health and metrics run on separate ports so Envoy and
 Kubernetes can probe readiness without going through
 the ExtProc protocol.
 
+### Readiness and Health
+
+The health server reports the standard gRPC
+`ServingStatus` for the `ExternalProcessor` service
+(`envoy.service.ext_proc.v3.ExternalProcessor`):
+
+- **`Serving`** — the filter pipeline built
+  successfully and the ExtProc gRPC server is running.
+- **`NotServing`** — the filter pipeline failed to
+  build at startup (invalid configuration). The
+  process stays up so it can be inspected, but the
+  ExtProc gRPC server is **not** started.
+
+This is a deliberate *alive-but-not-ready* state: a
+bad configuration does not crash-loop the pod. Instead,
+operators must **consume the readiness signal** to
+keep traffic away from a pod that cannot process
+requests. Two consequences follow:
+
+- **Readiness** must use a **gRPC** health probe
+  (`grpc:`), which understands `ServingStatus`. A
+  `tcpSocket` probe only checks that the port is open
+  and would report a `NotServing` pod as ready. The
+  probe must target the `ExternalProcessor` service by
+  name — the default empty service (`""`) is always
+  `Serving`. The gRPC probe requires a *numeric* port;
+  named ports are not supported.
+- **Liveness** stays a `tcpSocket` check. A `NotServing`
+  pod is intentionally kept alive, so a gRPC liveness
+  probe would fail and crash-loop it.
+
+See `deploy/base/instance/deployment.yaml` for the
+probe configuration. Scope note: this covers pipeline
+build failure **at startup** only — there is currently
+no pipeline reload or runtime degradation handling.
+
 ### Metrics
 
 Five metrics are exported:

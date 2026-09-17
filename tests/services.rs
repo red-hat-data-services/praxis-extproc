@@ -35,7 +35,7 @@ async fn health_server_starts_and_stops() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let handle =
-        tokio::spawn(async move { praxis_extproc::health::serve(addr, async { drop(shutdown_rx.await) }).await });
+        tokio::spawn(async move { praxis_extproc::health::serve(addr, true, async { drop(shutdown_rx.await) }).await });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -54,7 +54,7 @@ async fn health_check_responds_serving() {
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    tokio::spawn(async move { praxis_extproc::health::serve(addr, async { drop(shutdown_rx.await) }).await });
+    tokio::spawn(async move { praxis_extproc::health::serve(addr, true, async { drop(shutdown_rx.await) }).await });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -66,8 +66,13 @@ async fn health_check_responds_serving() {
 
     let mut client = tonic_health::pb::health_client::HealthClient::new(channel);
 
+    let service = <praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer<
+        praxis_extproc::server::PraxisExtProc,
+    > as tonic::server::NamedService>::NAME
+        .to_owned();
+
     let resp = client
-        .check(tonic_health::pb::HealthCheckRequest { service: String::new() })
+        .check(tonic_health::pb::HealthCheckRequest { service })
         .await
         .expect("health check should succeed");
 
@@ -75,6 +80,41 @@ async fn health_check_responds_serving() {
         resp.into_inner().status,
         i32::from(tonic_health::pb::health_check_response::ServingStatus::Serving),
         "should report SERVING"
+    );
+}
+
+#[tokio::test]
+async fn health_check_responds_not_serving() {
+    let addr = next_addr();
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move { praxis_extproc::health::serve(addr, false, async { drop(shutdown_rx.await) }).await });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .expect("valid uri")
+        .connect()
+        .await
+        .expect("should connect to health server");
+
+    let mut client = tonic_health::pb::health_client::HealthClient::new(channel);
+
+    let service = <praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer<
+        praxis_extproc::server::PraxisExtProc,
+    > as tonic::server::NamedService>::NAME
+        .to_owned();
+
+    let resp = client
+        .check(tonic_health::pb::HealthCheckRequest { service })
+        .await
+        .expect("health check should succeed");
+
+    assert_eq!(
+        resp.into_inner().status,
+        i32::from(tonic_health::pb::health_check_response::ServingStatus::NotServing),
+        "should report NotServing"
     );
 }
 
