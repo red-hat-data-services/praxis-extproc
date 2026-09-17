@@ -325,7 +325,7 @@ fn build_self_signed() -> crate::error::Result<SslAcceptor> {
         .map_err(|e| crate::error::ExtProcError::Config(format!("X509: {e}")))?;
     let pkey = PKey::private_key_from_pem(cert.key_pair.serialize_pem().as_bytes())
         .map_err(|e| crate::error::ExtProcError::Config(format!("private key: {e}")))?;
-    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
         .map_err(|e| crate::error::ExtProcError::Config(format!("SSL context: {e}")))?;
     builder
         .set_certificate(&x509)
@@ -356,7 +356,7 @@ fn build_provided(cfg: &TlsConfig) -> crate::error::Result<SslAcceptor> {
         .as_deref()
         .ok_or_else(|| crate::error::ExtProcError::Config("tls.key_path required for provided mode".to_owned()))?;
     info!(cert = cert_path, key = key_path, "loading TLS certificate");
-    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
         .map_err(|e| crate::error::ExtProcError::Config(format!("SSL context: {e}")))?;
     builder
         .set_certificate_chain_file(cert_path)
