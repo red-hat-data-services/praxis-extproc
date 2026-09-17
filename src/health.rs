@@ -10,31 +10,38 @@ use std::future::Future;
 
 use tracing::info;
 
+/// The `ExternalProcessor` gRPC server type whose serving status is reported.
+type ExtProcServer = praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer<
+    crate::server::PraxisExtProc,
+>;
+
 // -----------------------------------------------------------------------------
 // Health Service
 // -----------------------------------------------------------------------------
 
 /// Start a gRPC health check server on the given address.
 ///
-/// Registers the `ExternalProcessor` service as `SERVING` and blocks
-/// until the provided shutdown future completes.
+/// Registers the `ExternalProcessor` service as `Serving` when `serving` is
+/// true, otherwise `NotServing`, and blocks until the provided shutdown
+/// future completes.
 ///
 /// # Errors
 ///
 /// Returns a transport error if the server fails to bind or serve.
 pub async fn serve(
     addr: std::net::SocketAddr,
+    serving: bool,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
     let (reporter, svc) = tonic_health::server::health_reporter();
 
-    reporter
-        .set_serving::<praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer<
-            crate::server::PraxisExtProc,
-        >>()
-        .await;
+    if serving {
+        reporter.set_serving::<ExtProcServer>().await;
+    } else {
+        reporter.set_not_serving::<ExtProcServer>().await;
+    }
 
-    info!(address = %addr, "health server listening");
+    info!(address = %addr, serving, "health server listening");
 
     tonic::transport::Server::builder()
         .add_service(svc)

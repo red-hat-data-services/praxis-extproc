@@ -54,8 +54,9 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 20
           readinessProbe:
-            tcpSocket:
-              port: health
+            grpc:
+              port: 50052
+              service: envoy.service.ext_proc.v3.ExternalProcessor
             initialDelaySeconds: 5
             periodSeconds: 10
           volumeMounts:

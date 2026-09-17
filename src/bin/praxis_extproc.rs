@@ -6,7 +6,7 @@
 
 //! Binary entry point for the Praxis ExtProc server.
 
-use std::process;
+use std::{future::Future, process};
 
 use clap::Parser;
 use praxis_extproc::{
@@ -69,57 +69,134 @@ async fn main() {
 // -----------------------------------------------------------------------------
 
 /// Top-level application logic.
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = load_config(&cli.config)?;
     let registry = praxis_ai_filters::build_ai_registry();
-    let pipeline = config::build_pipeline(&cfg, &registry)?;
+    let pipeline = config::build_pipeline(&cfg, &registry);
 
     if cli.validate {
+        pipeline?;
         info!("configuration is valid");
         return Ok(());
     }
 
     let addrs = resolve_addresses(&cli, &cfg)?;
 
-    info!(
-        grpc = %addrs.0, health = %addrs.1,
-        metrics = %addrs.2, filters = pipeline.len(),
-        "starting ExtProc server"
-    );
-
-    Box::pin(start_services(addrs, pipeline, &cfg.server.tls)).await
+    match pipeline {
+        Ok(pipeline) => {
+            info!(
+                grpc = %addrs.0, health = %addrs.1,
+                metrics = %addrs.2, filters = pipeline.len(),
+                "starting ExtProc server"
+            );
+            Box::pin(start_services(addrs, pipeline, &cfg.server.tls)).await
+        },
+        Err(e) => {
+            error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
+            Box::pin(serve_unready(addrs)).await
+        },
+    }
 }
 
-/// Start gRPC, health, and metrics servers concurrently.
-#[expect(clippy::cognitive_complexity, reason = "async state machine for server startup")]
+/// Start gRPC, health (`Serving`), and metrics servers concurrently.
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     tls_cfg: &tls::TlsConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Box::pin(run_with_sidecars(addrs, true, serve_grpc(addrs.0, pipeline, tls_cfg))).await
+}
+
+/// Serve only health (`NotServing`) and metrics when the pipeline failed to
+/// build, keeping the process alive and inspectable until shutdown.
+async fn serve_unready(
+    addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Box::pin(run_with_sidecars(addrs, false, async {
+        shutdown_signal().await;
+        Ok(())
+    }))
+    .await
+}
+
+/// Which of the supervised futures completed first in [`run_with_sidecars`].
+#[derive(PartialEq)]
+enum Selected {
+    /// The foreground future (gRPC serving or the shutdown wait).
+    Foreground,
+    /// The health check sidecar.
+    Health,
+    /// The metrics sidecar.
+    Metrics,
+}
+
+/// Run the health and metrics sidecars alongside a foreground future.
+///
+/// Health is registered as serving per `serving`. All three futures are
+/// supervised together: whichever completes first triggers shutdown of the
+/// remaining tasks, and its result (including a sidecar's bind failure) is
+/// returned as the originating error.
+async fn run_with_sidecars(
+    addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
+    serving: bool,
+    foreground: impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
     let health_rx = shutdown_tx.subscribe();
-    let health_handle =
-        tokio::spawn(async move { praxis_extproc::health::serve(addrs.1, wait_broadcast(health_rx)).await });
+    let mut health =
+        tokio::spawn(async move { praxis_extproc::health::serve(addrs.1, serving, wait_broadcast(health_rx)).await });
 
     let metrics_rx = shutdown_tx.subscribe();
-    let metrics_handle =
+    let mut metrics =
         tokio::spawn(async move { praxis_extproc::metrics::serve(addrs.2, wait_broadcast(metrics_rx)).await });
 
-    serve_grpc(addrs.0, pipeline, tls_cfg).await?;
+    tokio::pin!(foreground);
 
-    drop(shutdown_tx);
+    let (outcome, selected) = tokio::select! {
+        r = &mut foreground => (r, Selected::Foreground),
+        r = &mut health => (task_outcome(r), Selected::Health),
+        r = &mut metrics => (task_outcome(r), Selected::Metrics),
+    };
 
-    if let Err(e) = health_handle.await {
-        error!(error = %e, "health server task failed");
+    drop(shutdown_tx); // signal the remaining sidecars to stop
+
+    // Await and log every sidecar except the one already consumed by the select.
+    if selected != Selected::Health {
+        drain("health", health).await;
     }
-    if let Err(e) = metrics_handle.await {
-        error!(error = %e, "metrics server task failed");
+    if selected != Selected::Metrics {
+        drain("metrics", metrics).await;
     }
 
-    info!("server shut down");
-    Ok(())
+    if outcome.is_ok() {
+        info!("server shut down");
+    }
+    outcome
+}
+
+/// Collapse a task's join result and its inner service result into one error.
+fn task_outcome<E>(
+    joined: Result<Result<(), E>, tokio::task::JoinError>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match joined {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(Box::new(e)), // service error (e.g. failed to bind)
+        Err(e) => Err(Box::new(e)),     // join error (panic / cancel)
+    }
+}
+
+/// Await a still-running sidecar during shutdown, logging either error layer.
+async fn drain<E>(name: &str, handle: tokio::task::JoinHandle<Result<(), E>>)
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    if let Err(e) = task_outcome(handle.await) {
+        error!(error = %e, "{name} server stopped with error");
+    }
 }
 
 /// Start the main gRPC ExtProc server.
@@ -127,7 +204,7 @@ async fn serve_grpc(
     addr: std::net::SocketAddr,
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     tls_cfg: &tls::TlsConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline));
     match tls::build_tls_config(tls_cfg)? {
         None => Box::pin(serve_plaintext(addr, svc)).await,
@@ -139,7 +216,7 @@ async fn serve_grpc(
 async fn serve_plaintext(
     addr: std::net::SocketAddr,
     svc: ExternalProcessorServer<PraxisExtProc>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Box::pin(
         Server::builder()
             .add_service(svc)
@@ -155,7 +232,7 @@ async fn serve_tls(
     svc: ExternalProcessorServer<PraxisExtProc>,
     acceptor: openssl::ssl::SslAcceptor,
     tls_cfg: &tls::TlsConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs);
     let incoming = tls::build_tls_incoming(listener, acceptor, tls_cfg.handshake_concurrency, timeout);
@@ -223,7 +300,8 @@ fn init_tracing() {
 fn resolve_addresses(
     cli: &Cli,
     cfg: &ExtProcConfig,
-) -> Result<(std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr), Box<dyn std::error::Error>> {
+) -> Result<(std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr), Box<dyn std::error::Error + Send + Sync>>
+{
     let grpc = parse_addr(&cli.grpc_address, &cfg.server.grpc_address)?;
     let health = parse_addr(&cli.health_address, &cfg.server.health_address)?;
     let metrics = parse_addr(&cli.metrics_address, &cfg.server.metrics_address)?;
@@ -246,7 +324,7 @@ fn load_config(path: &str) -> Result<ExtProcConfig, ExtProcError> {
 fn parse_addr(
     cli_override: &Option<String>,
     config_default: &str,
-) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
+) -> Result<std::net::SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let s = cli_override.as_deref().unwrap_or(config_default);
     Ok(s.parse()?)
 }
