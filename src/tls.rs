@@ -20,9 +20,17 @@ use std::{
 
 use futures::StreamExt as _;
 use openssl::{
-    pkey::PKey,
+    asn1::Asn1Time,
+    bn::{BigNum, MsbOption},
+    hash::MessageDigest,
+    nid::Nid,
+    pkey::{Id, PKey, Private},
+    pkey_ctx::PkeyCtx,
     ssl::{AlpnError, Ssl, SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod, SslVerifyMode, select_next_proto},
-    x509::X509,
+    x509::{
+        X509, X509Builder, X509NameBuilder,
+        extension::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName},
+    },
 };
 use serde::Deserialize;
 use tokio::{
@@ -301,6 +309,8 @@ async fn perform_handshake(
     acceptor: Arc<SslAcceptor>,
 ) -> Result<OpenSslStream, io::Error> {
     let stream = result?;
+    // Disable Nagle. tonic's TCP_NODELAY does not reach this stream.
+    stream.set_nodelay(true)?;
     let local_addr = stream.local_addr().ok();
     let remote_addr = stream.peer_addr().ok();
     let ssl = Ssl::new(acceptor.context()).map_err(io::Error::other)?;
@@ -316,25 +326,104 @@ async fn perform_handshake(
     })
 }
 
-/// Generate an ephemeral self-signed certificate using `rcgen`.
+/// Build a `SslAcceptor` for an ephemeral self-signed certificate.
 fn build_self_signed() -> crate::error::Result<SslAcceptor> {
     info!("generating self-signed TLS certificate");
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-        .map_err(|e| crate::error::ExtProcError::Config(format!("self-signed cert: {e}")))?;
-    let x509 = X509::from_pem(cert.cert.pem().as_bytes())
-        .map_err(|e| crate::error::ExtProcError::Config(format!("X509: {e}")))?;
-    let pkey = PKey::private_key_from_pem(cert.key_pair.serialize_pem().as_bytes())
-        .map_err(|e| crate::error::ExtProcError::Config(format!("private key: {e}")))?;
-    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
-        .map_err(|e| crate::error::ExtProcError::Config(format!("SSL context: {e}")))?;
+    let (cert, pkey) = self_signed_cert()?;
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(|e| cfg_err("SSL context", e))?;
     builder
-        .set_certificate(&x509)
-        .map_err(|e| crate::error::ExtProcError::Config(format!("set certificate: {e}")))?;
+        .set_certificate(&cert)
+        .map_err(|e| cfg_err("set certificate", e))?;
     builder
         .set_private_key(&pkey)
-        .map_err(|e| crate::error::ExtProcError::Config(format!("set private key: {e}")))?;
+        .map_err(|e| cfg_err("set private key", e))?;
     set_alpn_h2(&mut builder)?;
     Ok(builder.build())
+}
+
+/// Wrap an `OpenSSL` error as a TLS config error.
+fn cfg_err(what: &str, e: impl fmt::Display) -> crate::error::ExtProcError {
+    crate::error::ExtProcError::Config(format!("{what}: {e}"))
+}
+
+/// Generate a P-256 key through the EVP keygen path, so key generation runs in
+/// the active provider (the FIPS module under FIPS). The legacy `EcKey::generate`
+/// bypasses the provider and must not be used here.
+fn generate_p256_key() -> crate::error::Result<PKey<Private>> {
+    let mut ctx = PkeyCtx::new_id(Id::EC).map_err(|e| cfg_err("EC keygen context", e))?;
+    ctx.keygen_init().map_err(|e| cfg_err("EC keygen init", e))?;
+    ctx.set_ec_paramgen_curve_nid(Nid::X9_62_PRIME256V1)
+        .map_err(|e| cfg_err("EC curve", e))?;
+    ctx.keygen().map_err(|e| cfg_err("EC keygen", e))
+}
+
+/// Append the leaf extensions (`basicConstraints` CA:false, SAN `DNS:localhost`).
+fn append_leaf_extensions(builder: &mut X509Builder) -> crate::error::Result<()> {
+    let basic = BasicConstraints::new()
+        .critical()
+        .build()
+        .map_err(|e| cfg_err("basic constraints", e))?;
+    builder
+        .append_extension(basic)
+        .map_err(|e| cfg_err("basic constraints", e))?;
+    let key_usage = KeyUsage::new()
+        .critical()
+        .digital_signature()
+        .build()
+        .map_err(|e| cfg_err("key usage", e))?;
+    builder
+        .append_extension(key_usage)
+        .map_err(|e| cfg_err("key usage", e))?;
+    let ext_key_usage = ExtendedKeyUsage::new()
+        .server_auth()
+        .build()
+        .map_err(|e| cfg_err("extended key usage", e))?;
+    builder
+        .append_extension(ext_key_usage)
+        .map_err(|e| cfg_err("extended key usage", e))?;
+    let san = SubjectAlternativeName::new()
+        .dns("localhost")
+        .build(&builder.x509v3_context(None, None))
+        .map_err(|e| cfg_err("subject alt name", e))?;
+    builder
+        .append_extension(san)
+        .map_err(|e| cfg_err("subject alt name", e))
+}
+
+/// Generate a P-256 key and a matching self-signed certificate, entirely in
+/// `OpenSSL`.
+fn self_signed_cert() -> crate::error::Result<(X509, PKey<Private>)> {
+    let pkey = generate_p256_key()?;
+
+    let mut name = X509NameBuilder::new().map_err(|e| cfg_err("name", e))?;
+    name.append_entry_by_text("CN", "localhost")
+        .map_err(|e| cfg_err("name", e))?;
+    let name = name.build();
+
+    let mut serial = BigNum::new().map_err(|e| cfg_err("serial", e))?;
+    serial
+        .rand(159, MsbOption::ONE, false)
+        .map_err(|e| cfg_err("serial", e))?;
+    let serial = serial.to_asn1_integer().map_err(|e| cfg_err("serial", e))?;
+
+    let mut builder = X509Builder::new().map_err(|e| cfg_err("certificate", e))?;
+    builder.set_version(2).map_err(|e| cfg_err("version", e))?;
+    builder.set_serial_number(&serial).map_err(|e| cfg_err("serial", e))?;
+    builder.set_subject_name(&name).map_err(|e| cfg_err("subject", e))?;
+    builder.set_issuer_name(&name).map_err(|e| cfg_err("issuer", e))?;
+    builder.set_pubkey(&pkey).map_err(|e| cfg_err("public key", e))?;
+    let not_before = Asn1Time::days_from_now(0).map_err(|e| cfg_err("not before", e))?;
+    builder
+        .set_not_before(&not_before)
+        .map_err(|e| cfg_err("not before", e))?;
+    let not_after = Asn1Time::days_from_now(365).map_err(|e| cfg_err("not after", e))?;
+    builder.set_not_after(&not_after).map_err(|e| cfg_err("not after", e))?;
+    append_leaf_extensions(&mut builder)?;
+
+    builder
+        .sign(&pkey, MessageDigest::sha256())
+        .map_err(|e| cfg_err("sign", e))?;
+    Ok((builder.build(), pkey))
 }
 
 /// Load certificate and key from disk, optionally configuring mTLS.
@@ -390,7 +479,8 @@ fn set_alpn_h2(builder: &mut SslAcceptorBuilder) -> crate::error::Result<()> {
     builder
         .set_alpn_protos(b"\x02h2")
         .map_err(|e| crate::error::ExtProcError::Config(format!("ALPN protos: {e}")))?;
-    builder.set_alpn_select_callback(|_ssl, client| select_next_proto(b"\x02h2", client).ok_or(AlpnError::NOACK));
+    // Fail the handshake on missing h2 rather than deferring to an opaque error.
+    builder.set_alpn_select_callback(|_ssl, client| select_next_proto(b"\x02h2", client).ok_or(AlpnError::ALERT_FATAL));
     Ok(())
 }
 

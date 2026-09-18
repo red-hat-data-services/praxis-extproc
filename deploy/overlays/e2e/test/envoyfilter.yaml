@@ -32,6 +32,7 @@ spec:
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
               common_tls_context:
+                alpn_protocols: ["h2"]
                 validation_context:
                   trust_chain_verification: ACCEPT_UNTRUSTED
               sni: payload-pre-processing.istio-system.svc.cluster.local
@@ -63,6 +64,7 @@ spec:
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
               common_tls_context:
+                alpn_protocols: ["h2"]
                 validation_context:
                   trust_chain_verification: ACCEPT_UNTRUSTED
               sni: payload-processing.istio-system.svc.cluster.local

@@ -15,6 +15,7 @@
 pub mod adapter;
 pub mod config;
 pub mod error;
+pub mod fips;
 pub mod health;
 pub mod metrics;
 pub mod response;
