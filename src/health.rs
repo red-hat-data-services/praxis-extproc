@@ -15,6 +15,12 @@ type ExtProcServer = praxis_proto::envoy::service::ext_proc::v3::external_proces
     crate::server::PraxisExtProc,
 >;
 
+/// Health service name carrying the FIPS approved-mode state.
+///
+/// Reported as `Serving` when FIPS is active, `NotServing` otherwise, so a probe
+/// can distinguish a FIPS gate failure from pipeline readiness.
+pub const FIPS_SERVICE: &str = "fips";
+
 // -----------------------------------------------------------------------------
 // Health Service
 // -----------------------------------------------------------------------------
@@ -22,8 +28,8 @@ type ExtProcServer = praxis_proto::envoy::service::ext_proc::v3::external_proces
 /// Start a gRPC health check server on the given address.
 ///
 /// Registers the `ExternalProcessor` service as `Serving` when `serving` is
-/// true, otherwise `NotServing`, and blocks until the provided shutdown
-/// future completes.
+/// true, otherwise `NotServing`, reports the FIPS state under [`FIPS_SERVICE`],
+/// and blocks until the provided shutdown future completes.
 ///
 /// # Errors
 ///
@@ -31,8 +37,11 @@ type ExtProcServer = praxis_proto::envoy::service::ext_proc::v3::external_proces
 pub async fn serve(
     addr: std::net::SocketAddr,
     serving: bool,
+    fips_active: bool,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
+    use tonic_health::ServingStatus;
+
     let (reporter, svc) = tonic_health::server::health_reporter();
 
     if serving {
@@ -41,7 +50,14 @@ pub async fn serve(
         reporter.set_not_serving::<ExtProcServer>().await;
     }
 
-    info!(address = %addr, serving, "health server listening");
+    let fips_status = if fips_active {
+        ServingStatus::Serving
+    } else {
+        ServingStatus::NotServing
+    };
+    reporter.set_service_status(FIPS_SERVICE, fips_status).await;
+
+    info!(address = %addr, serving, fips = fips_active, "health server listening");
 
     tonic::transport::Server::builder()
         .add_service(svc)

@@ -82,6 +82,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let addrs = resolve_addresses(&cli, &cfg)?;
 
+    // The `fips` feature makes approved-mode a hard requirement at compile time.
+    // Whether the host is in approved mode is probed at runtime.
+    let fips = praxis_extproc::fips::assess();
+    if !fips.serve_ok {
+        return Box::pin(serve_unready(addrs, fips.active)).await;
+    }
+
+    Box::pin(serve_pipeline(addrs, pipeline, &cfg.server.tls, fips.active)).await
+}
+
+/// Serve the built pipeline, or a not-ready endpoint if it failed to build.
+async fn serve_pipeline(
+    addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
+    pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
+    tls_cfg: &tls::TlsConfig,
+    fips_active: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match pipeline {
         Ok(pipeline) => {
             info!(
@@ -89,11 +106,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 metrics = %addrs.2, filters = pipeline.len(),
                 "starting ExtProc server"
             );
-            Box::pin(start_services(addrs, pipeline, &cfg.server.tls)).await
+            Box::pin(start_services(addrs, pipeline, tls_cfg, fips_active)).await
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
-            Box::pin(serve_unready(addrs)).await
+            Box::pin(serve_unready(addrs, fips_active)).await
         },
     }
 }
@@ -103,16 +120,25 @@ async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     tls_cfg: &tls::TlsConfig,
+    fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(run_with_sidecars(addrs, true, serve_grpc(addrs.0, pipeline, tls_cfg))).await
+    Box::pin(run_with_sidecars(
+        addrs,
+        true,
+        fips_active,
+        serve_grpc(addrs.0, pipeline, tls_cfg),
+    ))
+    .await
 }
 
 /// Serve only health (`NotServing`) and metrics when the pipeline failed to
-/// build, keeping the process alive and inspectable until shutdown.
+/// build or the FIPS gate refused, keeping the process alive and inspectable
+/// until shutdown.
 async fn serve_unready(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
+    fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(run_with_sidecars(addrs, false, async {
+    Box::pin(run_with_sidecars(addrs, false, fips_active, async {
         shutdown_signal().await;
         Ok(())
     }))
@@ -139,13 +165,15 @@ enum Selected {
 async fn run_with_sidecars(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     serving: bool,
+    fips_active: bool,
     foreground: impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
     let health_rx = shutdown_tx.subscribe();
-    let mut health =
-        tokio::spawn(async move { praxis_extproc::health::serve(addrs.1, serving, wait_broadcast(health_rx)).await });
+    let mut health = tokio::spawn(async move {
+        praxis_extproc::health::serve(addrs.1, serving, fips_active, wait_broadcast(health_rx)).await
+    });
 
     let metrics_rx = shutdown_tx.subscribe();
     let mut metrics =

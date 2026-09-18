@@ -190,6 +190,17 @@ When `ca_cert_path` is set, the server requires
 clients to present a valid certificate signed by
 that CA (mTLS). Only available in `provided` mode.
 
+Over TLS the listener serves HTTP/2. It selects
+`h2` by ALPN when the client offers it, and a
+client that advertises no ALPN still connects and
+speaks h2 by prior knowledge. A client that
+advertises ALPN without `h2` is rejected with a
+fatal `no_application_protocol` alert, rather than
+failing later as an opaque HTTP/2 error. Setting
+`alpn_protocols: ["h2"]` on an upstream TLS client,
+such as Envoy's ExtProc cluster, makes the
+negotiation explicit.
+
 `handshake_concurrency` bounds how many TLS
 handshakes run in parallel; when all slots are
 occupied, new TCP accepts stall until a slot frees.

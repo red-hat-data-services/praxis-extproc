@@ -34,8 +34,9 @@ async fn health_server_starts_and_stops() {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    let handle =
-        tokio::spawn(async move { praxis_extproc::health::serve(addr, true, async { drop(shutdown_rx.await) }).await });
+    let handle = tokio::spawn(async move {
+        praxis_extproc::health::serve(addr, true, true, async { drop(shutdown_rx.await) }).await
+    });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -54,7 +55,9 @@ async fn health_check_responds_serving() {
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    tokio::spawn(async move { praxis_extproc::health::serve(addr, true, async { drop(shutdown_rx.await) }).await });
+    tokio::spawn(
+        async move { praxis_extproc::health::serve(addr, true, true, async { drop(shutdown_rx.await) }).await },
+    );
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -89,7 +92,9 @@ async fn health_check_responds_not_serving() {
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    tokio::spawn(async move { praxis_extproc::health::serve(addr, false, async { drop(shutdown_rx.await) }).await });
+    tokio::spawn(
+        async move { praxis_extproc::health::serve(addr, false, false, async { drop(shutdown_rx.await) }).await },
+    );
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -115,6 +120,41 @@ async fn health_check_responds_not_serving() {
         resp.into_inner().status,
         i32::from(tonic_health::pb::health_check_response::ServingStatus::NotServing),
         "should report NotServing"
+    );
+}
+
+#[tokio::test]
+async fn health_reports_fips_service_status() {
+    let addr = next_addr();
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // serving=false, fips_active=true: the ExtProc and FIPS statuses are independent.
+    tokio::spawn(
+        async move { praxis_extproc::health::serve(addr, false, true, async { drop(shutdown_rx.await) }).await },
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .expect("valid uri")
+        .connect()
+        .await
+        .expect("should connect to health server");
+
+    let mut client = tonic_health::pb::health_client::HealthClient::new(channel);
+
+    let resp = client
+        .check(tonic_health::pb::HealthCheckRequest {
+            service: praxis_extproc::health::FIPS_SERVICE.to_owned(),
+        })
+        .await
+        .expect("fips health check should succeed");
+
+    assert_eq!(
+        resp.into_inner().status,
+        i32::from(tonic_health::pb::health_check_response::ServingStatus::Serving),
+        "fips service should report SERVING when FIPS is active"
     );
 }
 

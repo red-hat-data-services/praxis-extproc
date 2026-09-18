@@ -2693,6 +2693,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-health",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "yaml_serde",
