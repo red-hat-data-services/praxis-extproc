@@ -721,6 +721,7 @@ async fn run_request_pipeline(
     state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
+    state.filter_state = mem::take(&mut ctx.filter_state);
 
     // Emit the authoritative buffer even when empty: a filter that cleared the
     // body must produce an explicit empty body AND content-length: 0. Collapsing
@@ -764,6 +765,7 @@ async fn run_response_pipeline(
 
     let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
+    ctx.filter_state = mem::take(&mut state.filter_state);
     let original_headers = capture_original_headers(&resp);
     ctx.response_header = Some(&mut resp);
 
@@ -949,6 +951,7 @@ async fn process_streamed_body_chunk(
     })?;
     let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
+    ctx.filter_state = mem::take(&mut state.filter_state);
     if !is_request {
         let resp = state.response.as_mut().ok_or_else(|| {
             metrics::record_invalid_argument("missing_headers", "response");
@@ -969,6 +972,7 @@ async fn process_streamed_body_chunk(
     state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
+    state.filter_state = mem::take(&mut ctx.filter_state);
     let (mutation, body_mode) = if is_request {
         (
             state.deferred_request_header_mutation.take(),
@@ -1059,6 +1063,7 @@ async fn run_request_header_filters_early(
     state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
+    state.filter_state = mem::take(&mut ctx.filter_state);
     let mutation = adapter::collect_request_header_mutations(&ctx);
 
     Ok(delivery.deliver_request(mutation, state))
@@ -1076,6 +1081,7 @@ async fn run_response_header_filters_early(
 
     let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
+    ctx.filter_state = mem::take(&mut state.filter_state);
 
     let Some(resp) = state.response.as_mut() else {
         return Ok(delivery.deliver_response(None, state));
@@ -1090,6 +1096,8 @@ async fn run_response_header_filters_early(
     }
 
     state.header_state.response_filters_executed = true;
+    // Move filter_state back so the response-body phase's fresh ctx still sees it.
+    state.filter_state = mem::take(&mut ctx.filter_state);
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
 
     Ok(delivery.deliver_response(mutation, state))
@@ -1234,6 +1242,9 @@ struct StreamState {
 
     /// Metadata carried from request to response phase.
     filter_metadata: HashMap<String, String>,
+
+    /// Typed per-filter state carried from request to response phase.
+    filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
 
     /// Converted request from the headers phase.
     request: Option<Request>,
@@ -1985,5 +1996,87 @@ mod tests {
             &[("reason", "missing_headers"), ("detail", "response")],
         );
         assert_eq!(count, 1, "missing response headers must increment the counter");
+    }
+
+    /// Typed marker a probe filter stashes on request and reads on response.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Probe(u64);
+    /// Sentinel value carried through `filter_state`.
+    const PROBE_VALUE: u64 = 0x00C0_FFEE;
+    /// Value the probe observed in `on_response` (0 if state was lost).
+    static PROBE_OBSERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Filter that stores `Probe` on request and reports it back on response.
+    struct ProbeFilter;
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for ProbeFilter {
+        fn name(&self) -> &'static str {
+            "state_probe"
+        }
+
+        async fn on_request(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            ctx.insert_filter_state(Probe(PROBE_VALUE));
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            let observed = ctx.get_filter_state::<Probe>().map_or(0, |p| p.0);
+            PROBE_OBSERVED.store(observed, std::sync::atomic::Ordering::SeqCst);
+            Ok(FilterAction::Continue)
+        }
+    }
+    impl ProbeFilter {
+        /// Registry factory for `state_probe`.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    #[tokio::test]
+    async fn filter_state_survives_request_to_response_phase() {
+        use std::sync::atomic::Ordering;
+
+        use praxis_filter::FilterRegistry;
+
+        PROBE_OBSERVED.store(0, Ordering::SeqCst);
+        let cfg: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: state_probe\n")
+                .unwrap();
+        let mut registry = FilterRegistry::with_builtins();
+        registry
+            .register("state_probe", praxis_filter::http_builtin(ProbeFilter::from_config))
+            .unwrap();
+        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+
+        // Request phase stores state; it must be moved out into StreamState.
+        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state)
+            .await
+            .unwrap();
+        assert!(
+            state.filter_state.contains_key(&0),
+            "request-phase filter_state must persist into StreamState"
+        );
+
+        // Response phase builds a fresh ctx; state must be moved back in.
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+        run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            PROBE_OBSERVED.load(Ordering::SeqCst),
+            PROBE_VALUE,
+            "on_response must see state stored in on_request; 0 means it was dropped at the phase boundary"
+        );
     }
 }
