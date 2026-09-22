@@ -72,6 +72,13 @@ pub struct ServerConfig {
     /// TLS configuration.
     #[serde(default)]
     pub tls: crate::tls::TlsConfig,
+
+    /// Maximum seconds to drain in-flight streams on shutdown before
+    /// forcefully cancelling them.
+    ///
+    /// Defaults to [`DrainTimeoutSecs::default`]; must be greater than zero.
+    #[serde(default)]
+    pub shutdown_drain_timeout_secs: DrainTimeoutSecs,
 }
 
 impl Default for ServerConfig {
@@ -81,7 +88,48 @@ impl Default for ServerConfig {
             health_address: "0.0.0.0:50052".to_owned(),
             metrics_address: "0.0.0.0:9090".to_owned(),
             tls: crate::tls::TlsConfig::default(),
+            shutdown_drain_timeout_secs: DrainTimeoutSecs::default(),
         }
+    }
+}
+
+/// Graceful-drain deadline in seconds, guaranteed non-zero at parse time.
+///
+/// Constrained numeric parsed via `#[serde(try_from = "u64")]`, so an invalid
+/// (zero) value is rejected during deserialization rather than at a later
+/// validation step.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(try_from = "u64")]
+pub struct DrainTimeoutSecs(std::num::NonZeroU64);
+
+impl DrainTimeoutSecs {
+    /// The configured drain deadline, in seconds.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl Default for DrainTimeoutSecs {
+    /// 20s, chosen to fit inside the common 30s Kubernetes
+    /// `terminationGracePeriodSeconds` with headroom for a preStop lameduck
+    /// and final cleanup before SIGKILL.
+    fn default() -> Self {
+        // 20 is non-zero, so the fallback arm is never taken.
+        Self(match std::num::NonZeroU64::new(20) {
+            Some(v) => v,
+            None => std::num::NonZeroU64::MIN,
+        })
+    }
+}
+
+impl TryFrom<u64> for DrainTimeoutSecs {
+    type Error = &'static str;
+
+    fn try_from(value: u64) -> std::result::Result<Self, Self::Error> {
+        std::num::NonZeroU64::new(value)
+            .map(Self)
+            .ok_or("shutdown_drain_timeout_secs must be greater than zero")
     }
 }
 
@@ -197,6 +245,50 @@ server:
         .unwrap();
 
         assert_eq!(cfg.server.grpc_address, "127.0.0.1:9004", "address should match");
+    }
+
+    #[test]
+    fn shutdown_drain_timeout_defaults() {
+        let cfg: ExtProcConfig = serde_yaml::from_str("{}").unwrap();
+
+        assert_eq!(
+            cfg.server.shutdown_drain_timeout_secs.get(),
+            20,
+            "drain timeout should default to 20s"
+        );
+    }
+
+    #[test]
+    fn parse_custom_shutdown_drain_timeout() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+server:
+  shutdown_drain_timeout_secs: 5
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.server.shutdown_drain_timeout_secs.get(),
+            5,
+            "drain timeout should match"
+        );
+    }
+
+    #[test]
+    fn zero_shutdown_drain_timeout_rejected() {
+        let result: std::result::Result<ExtProcConfig, _> = serde_yaml::from_str(
+            r#"
+server:
+  shutdown_drain_timeout_secs: 0
+"#,
+        );
+
+        let err = result.expect_err("zero drain timeout should be rejected at parse time");
+        assert!(
+            err.to_string().contains("shutdown_drain_timeout_secs"),
+            "error should name the field: {err}"
+        );
     }
 
     #[test]
