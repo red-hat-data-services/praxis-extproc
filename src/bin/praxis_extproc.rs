@@ -89,7 +89,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Box::pin(serve_unready(addrs, fips.active)).await;
     }
 
-    Box::pin(serve_pipeline(addrs, pipeline, &cfg.server, fips.active)).await
+    Box::pin(serve_pipeline(
+        addrs,
+        pipeline,
+        &cfg.server,
+        cfg.max_body_accumulation(),
+        fips.active,
+    ))
+    .await
 }
 
 /// Serve the built pipeline, or a not-ready endpoint if it failed to build.
@@ -97,6 +104,7 @@ async fn serve_pipeline(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
     server_cfg: &config::ServerConfig,
+    max_body: Option<usize>,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match pipeline {
@@ -106,7 +114,7 @@ async fn serve_pipeline(
                 metrics = %addrs.2, filters = pipeline.len(),
                 "starting ExtProc server"
             );
-            Box::pin(start_services(addrs, pipeline, server_cfg, fips_active)).await
+            Box::pin(start_services(addrs, pipeline, server_cfg, max_body, fips_active)).await
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
@@ -120,10 +128,11 @@ async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
+    max_body: Option<usize>,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Box::pin(run_with_sidecars(addrs, true, fips_active, move |drain_rx| {
-        serve_grpc(addrs.0, pipeline, server_cfg, drain_rx)
+        serve_grpc(addrs.0, pipeline, server_cfg, max_body, drain_rx)
     }))
     .await
 }
@@ -240,12 +249,17 @@ async fn serve_grpc(
     addr: std::net::SocketAddr,
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
+    max_body: Option<usize>,
     drain_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The latch fires when the drain deadline expires, forcing any streams still
     // running after graceful shutdown began to cancel.
     let (force_tx, force_rx) = tokio::sync::watch::channel(false);
-    let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline).with_force_shutdown(force_rx.clone()));
+    let svc = ExternalProcessorServer::new(
+        PraxisExtProc::new(pipeline)
+            .with_max_body_accumulation(max_body)
+            .with_force_shutdown(force_rx.clone()),
+    );
     let drain = std::time::Duration::from_secs(server_cfg.shutdown_drain_timeout_secs.get());
     let controls = ShutdownControls {
         signal: Box::pin(shutdown_with_deadline(drain_rx, force_tx, drain)),

@@ -34,9 +34,6 @@ use crate::{
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Maximum accumulated body size before rejecting.
-const MAX_BODY_ACCUMULATION: usize = 10_485_760; // 10 MiB
-
 /// Channel buffer size for the response stream.
 const RESPONSE_CHANNEL_SIZE: usize = 16;
 
@@ -96,18 +93,25 @@ pub struct PraxisExtProc {
     /// Latch flipped to `true` when the shutdown drain deadline expires,
     /// signalling in-flight streams to cancel forcefully.
     force_shutdown: watch::Receiver<bool>,
+    /// Effective body-accumulation ceiling in bytes; `None` means unbounded.
+    max_body_accumulation: Option<usize>,
 }
 
 impl PraxisExtProc {
     /// Create a new ExtProc service backed by the given pipeline.
     ///
     /// No drain deadline is wired: the force-shutdown latch never fires. Use
-    /// [`with_force_shutdown`](Self::with_force_shutdown) to arm one.
+    /// [`with_force_shutdown`](Self::with_force_shutdown) to arm one. The
+    /// body-accumulation ceiling defaults to the built-in 10 MiB
+    /// (`config::DEFAULT_MAX_BODY_BYTES`); use
+    /// [`with_max_body_accumulation`](Self::with_max_body_accumulation) to set
+    /// the configured effective limit.
     pub fn new(pipeline: Arc<FilterPipeline>) -> Self {
         let (_tx, rx) = watch::channel(false); // `_tx` dropped => latch never fires
         Self {
             pipeline,
             force_shutdown: rx,
+            max_body_accumulation: Some(crate::config::DEFAULT_MAX_BODY_BYTES),
         }
     }
 
@@ -115,6 +119,13 @@ impl PraxisExtProc {
     #[must_use]
     pub fn with_force_shutdown(mut self, rx: watch::Receiver<bool>) -> Self {
         self.force_shutdown = rx;
+        self
+    }
+
+    /// Set the effective body-accumulation ceiling; `None` disables bounding.
+    #[must_use]
+    pub fn with_max_body_accumulation(mut self, limit: Option<usize>) -> Self {
+        self.max_body_accumulation = limit;
         self
     }
 }
@@ -147,12 +158,13 @@ impl ExternalProcessor for PraxisExtProc {
     ) -> Result<TonicResponse<Self::ProcessStream>, Status> {
         let pipeline = Arc::clone(&self.pipeline);
         let force = self.force_shutdown.clone();
+        let max_body = self.max_body_accumulation;
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
 
         tokio::spawn(async move {
             tokio::select! {
-                r = Box::pin(handle_stream(&pipeline, &mut inbound, &tx)) => {
+                r = Box::pin(handle_stream(&pipeline, &mut inbound, &tx, max_body)) => {
                     if let Err(e) = r {
                         error!(error = %e, "stream processing failed");
                         drop(tx.send(Err(e)).await);
@@ -186,9 +198,11 @@ async fn handle_stream(
     pipeline: &FilterPipeline,
     inbound: &mut Streaming<ProcessingRequest>,
     tx: &mpsc::Sender<Result<ProcessingResponse, Status>>,
+    max_body: Option<usize>,
 ) -> Result<(), Status> {
     let start = Instant::now();
     let mut stream_state = StreamState::new();
+    stream_state.max_body_accumulation = max_body;
 
     let result = process_messages(pipeline, inbound, tx, &mut stream_state).await;
 
@@ -643,7 +657,7 @@ async fn accumulate_request_body(
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    check_body_limit(state.request_body.len(), body.body.len())?;
+    check_body_limit(state.request_body.len(), body.body.len(), state.max_body_accumulation)?;
     state.request_body.extend_from_slice(&body.body);
 
     if !body.end_of_stream {
@@ -735,7 +749,7 @@ async fn accumulate_response_body(
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    check_body_limit(state.response_body.len(), body.body.len())?;
+    check_body_limit(state.response_body.len(), body.body.len(), state.max_body_accumulation)?;
     state.response_body.extend_from_slice(&body.body);
 
     if !body.end_of_stream {
@@ -1342,13 +1356,21 @@ struct StreamState {
 
     /// Per-direction phase ordering guard.
     phase_order: PhaseOrderTracker,
+
+    /// Effective body-accumulation ceiling in bytes; `None` means unbounded.
+    max_body_accumulation: Option<usize>,
 }
 
 impl StreamState {
     /// Create a new empty stream state with default protocol configuration.
+    ///
+    /// The body-accumulation ceiling defaults to the built-in 10 MiB
+    /// ([`crate::config::DEFAULT_MAX_BODY_BYTES`]); [`handle_stream`] overrides
+    /// it with the configured effective limit.
     fn new() -> Self {
         Self {
             protocol_config: ProtocolConfig::default(),
+            max_body_accumulation: Some(crate::config::DEFAULT_MAX_BODY_BYTES),
             ..Default::default()
         }
     }
@@ -1374,9 +1396,14 @@ fn extract_header_list(headers: &praxis_proto::envoy::service::ext_proc::v3::Htt
         .unwrap_or_default()
 }
 
-/// Reject body accumulation exceeding [`MAX_BODY_ACCUMULATION`].
-fn check_body_limit(current: usize, incoming: usize) -> Result<(), Status> {
-    if current + incoming > MAX_BODY_ACCUMULATION {
+/// Reject body accumulation exceeding the effective limit.
+///
+/// `limit` is `None` when bounding is disabled via
+/// `insecure_options.allow_unbounded_body`, in which case any size is accepted.
+fn check_body_limit(current: usize, incoming: usize, limit: Option<usize>) -> Result<(), Status> {
+    if let Some(max) = limit
+        && current.saturating_add(incoming) > max
+    {
         metrics::record_body_size_rejection();
         return Err(Status::resource_exhausted("body exceeds maximum size"));
     }
@@ -2012,11 +2039,24 @@ mod tests {
     fn check_body_limit_rejection_records_metric() {
         let count = counter_value("praxis_extproc_body_size_rejections_total", &[], || {
             assert!(
-                check_body_limit(MAX_BODY_ACCUMULATION, 1).is_err(),
+                check_body_limit(
+                    crate::config::DEFAULT_MAX_BODY_BYTES,
+                    1,
+                    Some(crate::config::DEFAULT_MAX_BODY_BYTES)
+                )
+                .is_err(),
                 "exceeding the body limit must be rejected"
             );
         });
         assert_eq!(count, 1, "body-size rejection must increment the counter");
+    }
+
+    #[test]
+    fn check_body_limit_unbounded_accepts_any_size() {
+        assert!(
+            check_body_limit(usize::MAX, usize::MAX, None).is_ok(),
+            "unbounded limit must accept any accumulation without overflow"
+        );
     }
 
     #[tokio::test]
