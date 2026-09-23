@@ -154,6 +154,7 @@ server:
   health_address: "0.0.0.0:50052"
   metrics_address: "0.0.0.0:9090"
   shutdown_drain_timeout_secs: 20
+  max_body_bytes: 10485760
   tls:
     mode: none
 ```
@@ -164,6 +165,7 @@ server:
 | `health_address`              | string  | `0.0.0.0:50052` | gRPC health check address                                                                                                                                                                                         |
 | `metrics_address`             | string  | `0.0.0.0:9090`  | Prometheus metrics address                                                                                                                                                                                        |
  | `shutdown_drain_timeout_secs` | integer | `20`            | Graceful-drain deadline in seconds; in-flight streams still running after it are force-cancelled. Must be **less than** the pod's `terminationGracePeriodSeconds` (leave headroom for a preStop lameduck and final cleanup); the `20` default fits inside the common `30`s k8s grace period |
+| `max_body_bytes`              | integer | `10485760`      | Maximum accumulated request/response body size in bytes before a stream is rejected with `RESOURCE_EXHAUSTED`. Must be greater than zero. Ignored when `insecure_options.allow_unbounded_body` is set, which lifts the cap entirely |
 | `tls`                         | object  | `mode: none`    | TLS configuration                                                                                                                                                                                                 |
 
 ### Graceful shutdown
@@ -278,7 +280,7 @@ startup.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `allow_unbounded_body` | bool | `false` | Allow unlimited body accumulation |
+| `allow_unbounded_body` | bool | `false` | Allow unlimited body accumulation, overriding `server.max_body_bytes` |
 
 ```yaml
 insecure_options:
@@ -373,9 +375,12 @@ At runtime:
 
 - **Filter error**: an `Err` from a filter produces
   a gRPC `INTERNAL` status on the stream.
-- **Body too large**: exceeding the 10 MiB
-  accumulation limit produces a gRPC
-  `RESOURCE_EXHAUSTED` status.
+- **Body too large**: exceeding the
+  `server.max_body_bytes` accumulation limit
+  (10 MiB by default) produces a gRPC
+  `RESOURCE_EXHAUSTED` status. The limit is lifted
+  entirely when `insecure_options.allow_unbounded_body`
+  is set.
 - **Filter rejection**: a `FilterAction::Reject`
   returns an `ImmediateResponse` to Envoy, which
   sends the rejection directly to the client.
