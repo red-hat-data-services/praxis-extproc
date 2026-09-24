@@ -16,6 +16,16 @@ use praxis_proto::envoy::service::ext_proc::v3::{
 };
 
 // -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Maximum body chunk size for streamed responses.
+///
+/// Envoy enforces a ~64 KiB limit per streamed body chunk. Using 62 KiB
+/// provides a safety margin.
+const BODY_CHUNK_LIMIT: usize = 63_488; // 62 KiB
+
+// -----------------------------------------------------------------------------
 // Body Processing Modes
 // -----------------------------------------------------------------------------
 
@@ -26,14 +36,18 @@ use praxis_proto::envoy::service::ext_proc::v3::{
 pub(crate) enum BodyMode {
     /// No body sent.
     None = 0,
+
     /// Body sent in streaming mode (incremental processing).
     Streamed = 1,
+
     /// Body buffered until complete, then sent as single chunk.
     #[default]
     Buffered = 2,
+
     /// Body sent in buffered partial mode.
     #[expect(dead_code, reason = "documents protocol; not yet implemented")]
     BufferedPartial = 3,
+
     /// Body sent in full-duplex streaming mode with chunked responses.
     FullDuplexStreamed = 4,
 }
@@ -60,16 +74,6 @@ impl TryFrom<i32> for BodyMode {
         }
     }
 }
-
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
-
-/// Maximum body chunk size for streamed responses.
-///
-/// Envoy enforces a ~64 KiB limit per streamed body chunk. Using 62 KiB
-/// provides a safety margin.
-const BODY_CHUNK_LIMIT: usize = 63_488; // 62 KiB
 
 // -----------------------------------------------------------------------------
 // Header Responses
@@ -752,6 +756,60 @@ mod tests {
     fn body_mode_from_i32_invalid_modes() {
         assert!(BodyMode::try_from(3).is_err());
         assert!(BodyMode::try_from(999).is_err());
+    }
+
+    #[test]
+    fn body_mode_none_with_no_mutation() {
+        let responses = request_body(None, None, BodyMode::None, true);
+
+        assert_eq!(responses.len(), 1, "None mode should produce single response");
+        assert!(
+            extract_body_mutation(&responses[0]).is_none(),
+            "None mode with no body should not produce body_mutation"
+        );
+    }
+
+    #[test]
+    fn body_mode_none_with_body_mutation() {
+        let data = b"modified by filter";
+        let responses = request_body(Some(data), None, BodyMode::None, true);
+
+        assert_eq!(responses.len(), 1, "None mode should produce single response");
+
+        let body_mut = extract_body_mutation(&responses[0]);
+        match body_mut.unwrap() {
+            body_mutation::Mutation::Body(bytes) => {
+                assert_eq!(
+                    bytes, data,
+                    "None mode should use Body variant when filter modified body"
+                );
+            },
+            other => panic!("None mode should use Body variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_mode_streamed_uses_body_variant() {
+        let data = vec![0_u8; BODY_CHUNK_LIMIT + 100];
+        let responses = request_body(Some(&data), None, BodyMode::Streamed, true);
+
+        assert_eq!(
+            responses.len(),
+            1,
+            "non-full-duplex Streamed mode should produce single response"
+        );
+
+        let body_mut = extract_body_mutation(&responses[0]);
+        match body_mut.unwrap() {
+            body_mutation::Mutation::Body(bytes) => {
+                assert_eq!(
+                    bytes.len(),
+                    data.len(),
+                    "Streamed (non-full-duplex) should use Body variant with full body"
+                );
+            },
+            other => panic!("Streamed (non-full-duplex) should use Body variant, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------------
