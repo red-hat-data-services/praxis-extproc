@@ -100,6 +100,10 @@ pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Reque
         request_headers_to_remove: Vec::new(),
         request_headers_to_set: Vec::new(),
         filter_metadata: HashMap::new(),
+        // Envoy owns the upstream call, so gRPC completion is never observed
+        // here, and ExtProc has no pre-read passes to carry mutations between.
+        grpc_completion: None,
+        prior_pre_read_mutations: Vec::new(),
         pre_read_mutations: Vec::new(),
         structured_metadata: HashMap::new(),
         filter_results: HashMap::new(),
@@ -117,6 +121,9 @@ pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Reque
         response_body_mode: BodyMode::Stream,
         response_header: None,
         response_headers_modified: false,
+        // Flipped by the server for response-phase contexts: a response
+        // exists only because Envoy reached the upstream.
+        upstream_reached: false,
         subrequest_response_mode: SubRequestResponseMode::Buffered,
         attempted_endpoints: Vec::new(),
         retry_policy: None,

@@ -70,11 +70,16 @@ async fn main() {
 
 /// Top-level application logic.
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Before anything that builds a filter registry, a subrequest client or a
+    // TLS configuration: the provider installed here is the only one there is.
+    let fips = praxis_extproc::fips::install()?;
+
     let cfg = load_config(&cli.config)?;
     let registry = praxis_ai_filters::build_ai_registry();
     let pipeline = config::build_pipeline(&cfg, &registry);
 
     if cli.validate {
+        fips.require()?;
         pipeline?;
         info!("configuration is valid");
         return Ok(());
@@ -82,11 +87,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let addrs = resolve_addresses(&cli, &cfg)?;
 
-    // The `fips` feature makes approved-mode a hard requirement at compile time.
-    // Whether the host is in approved mode is probed at runtime.
-    let fips = praxis_extproc::fips::assess();
-    if !fips.serve_ok {
-        return Box::pin(serve_unready(addrs, fips.active)).await;
+    // PRAXIS_REQUIRE_FIPS makes FIPS mode a hard requirement. The host decides
+    // whether it is in effect; when it is not, the process stays up and
+    // inspectable (health NotServing) but serves no traffic.
+    if let Err(e) = fips.require() {
+        error!(error = %e, "refusing to serve");
+        return Box::pin(serve_unready(addrs, fips.active())).await;
     }
 
     Box::pin(serve_pipeline(
@@ -94,7 +100,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         pipeline,
         &cfg.server,
         cfg.max_body_accumulation(),
-        fips.active,
+        fips.active(),
     ))
     .await
 }
@@ -138,8 +144,8 @@ async fn start_services(
 }
 
 /// Serve only health (`NotServing`) and metrics when the pipeline failed to
-/// build or the FIPS gate refused, keeping the process alive and inspectable
-/// until shutdown.
+/// build or FIPS mode is required and not in effect, keeping the process
+/// alive and inspectable until shutdown.
 async fn serve_unready(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     fips_active: bool,

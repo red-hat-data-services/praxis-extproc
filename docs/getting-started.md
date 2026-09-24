@@ -163,7 +163,8 @@ The response should include the `X-Processed-By` and
 
 ### Container Image
 
-Build the container image:
+Build the container image (the FIPS build on UBI 9;
+see [FIPS](fips.md)):
 
 ```console
 make container-release
@@ -172,9 +173,9 @@ make container-release
 Run directly:
 
 ```console
-docker run -p 50051:50051 -p 50052:50052 -p 9090:9090 \
+podman run -p 50051:50051 -p 50052:50052 -p 9090:9090 \
     -v $(pwd)/examples/praxis-extproc.yaml:/etc/praxis/extproc.yaml \
-    praxis-extproc:dev -c /etc/praxis/extproc.yaml
+    docker.io/library/praxis-extproc:dev -c /etc/praxis/extproc.yaml
 ```
 
 ## Local Development with KIND
