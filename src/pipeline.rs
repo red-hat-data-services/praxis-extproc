@@ -115,6 +115,7 @@ pub(crate) async fn run_response_pipeline(
     ctx.filter_state = mem::take(&mut state.filter_state);
     let original_headers = capture_original_headers(&resp);
     ctx.response_header = Some(&mut resp);
+    ctx.upstream_reached = true;
 
     let original_len = state.response_body.len();
     if let Some(rejection) = execute_response_pipeline_and_body_filters(
@@ -305,6 +306,7 @@ pub(crate) async fn process_streamed_body_chunk(
             Status::invalid_argument("response headers not received")
         })?;
         ctx.response_header = Some(resp);
+        ctx.upstream_reached = true;
     }
     let eos = body.end_of_stream;
     let mut chunk = body.body;
@@ -438,6 +440,7 @@ pub(crate) async fn run_response_header_filters_early(
 
     let original_headers = capture_original_headers(resp);
     ctx.response_header = Some(resp);
+    ctx.upstream_reached = true;
 
     let action = execute_response(pipeline, &mut ctx).await?;
     if let Some(imm) = check_reject(action) {
@@ -693,6 +696,10 @@ mod tests {
     const PROBE_VALUE: u64 = 0x00C0_FFEE;
     /// Value the probe observed in `on_response` (0 if state was lost).
     static PROBE_OBSERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// `upstream_reached` as the probe saw it in `on_request`.
+    static PROBE_UPSTREAM_ON_REQUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    /// `upstream_reached` as the probe saw it in `on_response`.
+    static PROBE_UPSTREAM_ON_RESPONSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// Filter that stores `Probe` on request and reports it back on response.
     struct ProbeFilter;
@@ -707,6 +714,7 @@ mod tests {
             ctx: &mut HttpFilterContext<'_>,
         ) -> Result<FilterAction, praxis_filter::FilterError> {
             ctx.insert_filter_state(Probe(PROBE_VALUE));
+            PROBE_UPSTREAM_ON_REQUEST.store(ctx.upstream_reached, std::sync::atomic::Ordering::SeqCst);
             Ok(FilterAction::Continue)
         }
 
@@ -716,6 +724,7 @@ mod tests {
         ) -> Result<FilterAction, praxis_filter::FilterError> {
             let observed = ctx.get_filter_state::<Probe>().map_or(0, |p| p.0);
             PROBE_OBSERVED.store(observed, std::sync::atomic::Ordering::SeqCst);
+            PROBE_UPSTREAM_ON_RESPONSE.store(ctx.upstream_reached, std::sync::atomic::Ordering::SeqCst);
             Ok(FilterAction::Continue)
         }
     }
@@ -727,6 +736,20 @@ mod tests {
         ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
             Ok(Box::new(Self))
         }
+    }
+
+    /// A pipeline of just the `state_probe` filter.
+    fn state_probe_pipeline() -> std::sync::Arc<FilterPipeline> {
+        use praxis_filter::FilterRegistry;
+
+        let cfg: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: state_probe\n")
+                .unwrap();
+        let mut registry = FilterRegistry::with_builtins();
+        registry
+            .register("state_probe", praxis_filter::http_builtin(ProbeFilter::from_config))
+            .unwrap();
+        crate::config::build_pipeline(&cfg, &registry).unwrap()
     }
 
     /// Removes temporary files created by protocol integration tests even
@@ -745,17 +768,8 @@ mod tests {
     async fn filter_state_survives_request_to_response_phase() {
         use std::sync::atomic::Ordering;
 
-        use praxis_filter::FilterRegistry;
-
         PROBE_OBSERVED.store(0, Ordering::SeqCst);
-        let cfg: crate::config::ExtProcConfig =
-            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: state_probe\n")
-                .unwrap();
-        let mut registry = FilterRegistry::with_builtins();
-        registry
-            .register("state_probe", praxis_filter::http_builtin(ProbeFilter::from_config))
-            .unwrap();
-        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+        let pipeline = state_probe_pipeline();
         let mut state = StreamState::new();
         state.request = Some(adapter::envoy_headers_to_request(&[]));
 
@@ -767,6 +781,10 @@ mod tests {
             state.filter_state.contains_key(&0),
             "request-phase filter_state must persist into StreamState"
         );
+        assert!(
+            !PROBE_UPSTREAM_ON_REQUEST.load(Ordering::SeqCst),
+            "request filters must not see upstream_reached before a response phase"
+        );
 
         // Response phase builds a fresh ctx; state must be moved back in.
         state.response = Some(adapter::envoy_headers_to_response(&[]));
@@ -777,6 +795,10 @@ mod tests {
             PROBE_OBSERVED.load(Ordering::SeqCst),
             PROBE_VALUE,
             "on_response must see state stored in on_request; 0 means it was dropped at the phase boundary"
+        );
+        assert!(
+            PROBE_UPSTREAM_ON_RESPONSE.load(Ordering::SeqCst),
+            "a response phase means Envoy reached the upstream; response filters must see upstream_reached"
         );
     }
 

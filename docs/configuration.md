@@ -99,6 +99,15 @@ See the [Praxis filter documentation] for core filters
 and the [Praxis AI filter documentation] for AI filter
 names and configuration options.
 
+Praxis AI groups its larger subsystems behind opt-in
+cargo features; this server builds in the standard
+filters and everything Praxis AI offers for the OpenAI
+Responses API (the response store with its Postgres and
+SQLite backends, Conversations, context compaction, MCP
+tools, the file resolver), as it did before those
+features existed. The FIPS build, which is the image,
+carries only the Responses filters; see [FIPS](fips.md).
+
 [Praxis AI]: https://github.com/praxis-proxy/ai
 [Praxis filter documentation]: https://github.com/praxis-proxy/praxis/blob/main/docs/filters.md
 [Praxis AI filter documentation]: https://github.com/praxis-proxy/ai/blob/main/docs/filters/README.md

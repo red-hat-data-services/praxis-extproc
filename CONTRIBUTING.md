@@ -9,7 +9,8 @@ feature proposals.
 
 - Rust stable 1.94+
 - Rust nightly (for `rustfmt`)
-- Docker 29.3.0+ or Podman (for container builds)
+- Docker 29.3.0+ or Podman (for container builds; the
+  FIPS checks need Podman on Linux)
 
 ## Getting Started
 

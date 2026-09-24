@@ -205,7 +205,9 @@ async fn process_messages(
         let req_type = request_type_label(&req);
         debug!(phase = req_type, "received ProcessingRequest");
 
-        let responses = dispatch_request(pipeline, req, stream_state).await?;
+        // Boxed: the dispatch future carries a full filter context, which would
+        // otherwise put this loop's frame past the large-stack-frames threshold.
+        let responses = Box::pin(dispatch_request(pipeline, req, stream_state)).await?;
         debug!(phase = req_type, count = responses.len(), "sending responses");
 
         for resp in responses {

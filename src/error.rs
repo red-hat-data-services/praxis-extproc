@@ -28,4 +28,9 @@ pub enum ExtProcError {
     /// gRPC transport error.
     #[error("grpc: {0}")]
     Grpc(#[from] tonic::transport::Error),
+
+    /// The crypto provider could not be installed, or FIPS mode is required
+    /// and not in effect.
+    #[error("crypto: {0}")]
+    Crypto(String),
 }
