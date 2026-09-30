@@ -150,10 +150,12 @@ filter_chains:
 | `stream-usage-enforcer` | *(none yet)* | **None** | [#44] |
 | `api-translation` | provider-native chain | Partial (reverse) | [#6] |
 | `apikey-injection` | `credential_inject` | Partial (SigV4/OAuth2) | [#6] |
+| `nemo-request-guard` / `nemo-response-guard` | `ai_guardrails` | Partial (timeout unit) | [#111] |
 
 [#5]: https://github.com/opendatahub-io/praxis-extproc/issues/5
 [#6]: https://github.com/opendatahub-io/praxis-extproc/issues/6
 [#7]: https://github.com/opendatahub-io/praxis-extproc/issues/7
+[#111]: https://github.com/opendatahub-io/praxis-extproc/issues/111
 
 ### Per-plugin notes
 
@@ -237,6 +239,32 @@ targeting Praxis ExtProc instead of Go IPP:
   Do not render this filter yet; it does not exist in
   the registry and pipeline construction fails on
   unknown filter names. Track via [#44].
+- **Convert the NeMo guardrail timeout to
+  milliseconds.** The IPP plugin's `timeoutSeconds` is
+  in seconds and defaults to `360`
+  ([`nemo_guard_base.go:43`][ipp-nemo]); the Praxis
+  `ai_guardrails` filter takes `timeout_ms` in
+  milliseconds and defaults to `10000` (10 s). Render
+  `timeout_ms` as the IPP `timeoutSeconds` value ×
+  1000 (for example, 360 s -> `timeout_ms: 360000`),
+  first resolving a zero or negative `timeoutSeconds`
+  to `360` — IPP treats nonpositive values as its
+  360 s default ([`nemo_guard_base.go`][ipp-nemo]), and
+  multiplying them directly yields `timeout_ms: 0`
+  (which Praxis rejects) or a negative value (which
+  does not deserialize as its unsigned timeout). Do
+  not copy the seconds value verbatim — `timeout_ms:
+  360` is 360 ms and will fail most rail checks. `ai_guardrails` has no `failure_mode` of its
+  own, and a timeout is handled differently per phase:
+  a request-phase failure propagates to the enclosing
+  Envoy HTTP `ext_proc` filter, where
+  `failure_mode_allow` decides fail-open vs
+  fail-closed; a response-phase failure replaces the
+  response body with a `guardrail_error` payload
+  (headers are already sent, so it cannot reject).
+  Tracked in [#111].
+
+[ipp-nemo]: https://github.com/opendatahub-io/ai-gateway-payload-processing/blob/7b58c88cb1187d08e43d5ec82e62130a667df1db/pkg/plugins/nemo/nemo_guard_base.go#L43
 
 [#4]: https://github.com/opendatahub-io/praxis-extproc/issues/4
 [#16]: https://github.com/opendatahub-io/praxis-extproc/issues/16
