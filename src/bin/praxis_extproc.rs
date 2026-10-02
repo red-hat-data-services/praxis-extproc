@@ -280,6 +280,7 @@ async fn serve_grpc(
     let svc = ExternalProcessorServer::new(
         PraxisExtProc::new(pipeline)
             .with_max_body_accumulation(max_body)
+            .with_trust_forwarded_for(server_cfg.trust_forwarded_for)
             .with_force_shutdown(force_rx.clone()),
     );
     let drain = std::time::Duration::from_secs(server_cfg.shutdown_drain_timeout_secs.get());
