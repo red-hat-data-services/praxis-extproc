@@ -88,6 +88,18 @@ pub struct ServerConfig {
     /// entirely.
     #[serde(default)]
     pub max_body_bytes: MaxBodyBytes,
+
+    /// Whether to derive the client address from `x-forwarded-for` when Envoy's
+    /// trusted `x-envoy-external-address` header is absent.
+    ///
+    /// Defaults to `false`: the leftmost `x-forwarded-for` entry is
+    /// client-supplied and spoofable. Enable it only behind a trusted ingress
+    /// that strips any client-supplied `x-forwarded-for` and writes the verified
+    /// client address as the header's sole entry; otherwise leave it disabled.
+    /// When `false`, an absent trusted header leaves the client address unset
+    /// rather than trusting attacker-controlled input.
+    #[serde(default)]
+    pub trust_forwarded_for: bool,
 }
 
 impl Default for ServerConfig {
@@ -99,6 +111,7 @@ impl Default for ServerConfig {
             tls: crate::tls::TlsConfig::default(),
             shutdown_drain_timeout_secs: DrainTimeoutSecs::default(),
             max_body_bytes: MaxBodyBytes::default(),
+            trust_forwarded_for: false,
         }
     }
 }
