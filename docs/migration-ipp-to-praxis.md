@@ -142,27 +142,34 @@ filter_chains:
 
 ### Plugin mapping
 
-| Go IPP plugin | Praxis filter | Parity | Gap tracked by |
-|---|---|---|---|
-| `body-field-to-header` | `model_to_header` | Full | — |
-| `maas-headers-guard` | `headers` + `when`/`unless` | Partial | [#5] |
-| `model-provider-resolver` | `intelligent_route` | Partial (K8s) | [#5], [#7] |
-| `stream-usage-enforcer` | *(none yet)* | **None** | [#44] |
-| `api-translation` | provider-native chain | Partial (reverse) | [#6] |
-| `apikey-injection` | `credential_inject` | Partial (SigV4/OAuth2) | [#6] |
-| `nemo-request-guard` / `nemo-response-guard` | `ai_guardrails` | Partial (timeout unit) | [#111] |
+| Go IPP plugin                                | Praxis filter                         | Parity                 | Gap tracked by |
+|----------------------------------------------|---------------------------------------|------------------------|----------------|
+| `body-field-to-header`                       | `model_to_header` / `json_body_field` | Full                   | —              |
+| `maas-headers-guard`                         | `headers` + `when`/`unless`           | Partial                | [#5]           |
+| `model-provider-resolver`                    | `intelligent_route`                   | Partial (K8s)          | [#5], [#7]     |
+| `stream-usage-enforcer`                      | *(none yet)*                          | **None**               | [#44]          |
+| `api-translation`                            | provider-native chain                 | Partial (reverse)      | [#6]           |
+| `apikey-injection`                           | `credential_inject`                   | Partial (SigV4/OAuth2) | [#6]           |
+| `nemo-request-guard` / `nemo-response-guard` | `ai_guardrails`                       | Partial (timeout unit) | [#111]         |
 
 [#5]: https://github.com/opendatahub-io/praxis-extproc/issues/5
 [#6]: https://github.com/opendatahub-io/praxis-extproc/issues/6
 [#7]: https://github.com/opendatahub-io/praxis-extproc/issues/7
 [#111]: https://github.com/opendatahub-io/praxis-extproc/issues/111
+[crd-weight]: https://github.com/opendatahub-io/ai-gateway-payload-processing/blob/02b214fc48e14ed12981d5e0c8bee76492e3800a/api/inference/v1alpha1/externalmodel_types.go#L101-L109
 
 ### Per-plugin notes
 
-- **`body-field-to-header` → `model_to_header`.**
-  Full parity. IPP's `fieldName: model` is fixed in
-  the Praxis filter (it always promotes the `model`
-  field); `headerName` maps to the `header` option.
+- **`body-field-to-header` → `model_to_header` /
+  `json_body_field`.** Full parity, but the target
+  depends on `fieldName`. `model_to_header` is the
+  shortcut for the common `fieldName: model` case
+  used in the profile above: it always promotes the
+  `model` field, so only `headerName` (→ `header`) is
+  configurable. For any other `fieldName`, use the
+  core `json_body_field` filter, which takes both
+  `field` (→ `fieldName`) and `header` (→ `headerName`)
+  and can promote an arbitrary body field.
 - **`maas-headers-guard` → `headers`.** IPP captures
   inbound `x-maas-*` headers into request state for
   downstream plugins and guards them from
@@ -177,6 +184,29 @@ filter_chains:
   overlay (`routing-overlay.json`) with hot reload.
   The K8s-native routing behavior is tracked in [#5]
   and [#7].
+
+  **Weight scale and disable semantics differ — the
+  controller must translate.** The `ExternalModel`
+  CRD's `externalProviderRefs[].weight` is an integer
+  in `0–100`, defaulting to `1`, where `0` means
+  *disabled* — folding magnitude and enablement into
+  one field ([`externalmodel_types.go`][crd-weight]).
+  The overlay splits these into two orthogonal fields
+  per candidate:
+  - `traffic_weight` — an integer in `1–1000`
+    (only consulted when the selection group's picker
+    mode is `weighted_random`). `0` is **rejected**,
+    so a disabled provider must not be emitted as
+    `traffic_weight: 0`.
+  - `admission_state` — enablement, independent of
+    weight. Use `none` to exclude a candidate.
+
+  So when rendering the overlay, map a Go weight `w`:
+  - `w == 0` → **omit the provider from the
+    candidates list** (disabled).
+  - `w in 1–100` → rescale into `1–1000` (for example
+    `traffic_weight = w * 10`) and leave
+    `admission_state` at its enabled value.
 - **`stream-usage-enforcer` → none.** No Praxis
   filter injects `stream_options: {include_usage:
   true}` today. This is the only capability with no

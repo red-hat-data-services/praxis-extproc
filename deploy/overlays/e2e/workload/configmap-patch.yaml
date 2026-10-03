@@ -8,6 +8,10 @@ data:
       grpc_address: "0.0.0.0:9004"
       health_address: "0.0.0.0:50052"
       metrics_address: "0.0.0.0:9090"
+      # Enforce a small body cap on the fail-closed (failure_mode_allow: false)
+      # ext-proc so an oversized body deterministically yields a 5xx. The
+      # pre-processing ext-proc stays unbounded so routing still resolves.
+      max_body_bytes: 1048576
       tls:
         mode: self_signed
 
@@ -24,6 +28,3 @@ data:
             response_set:
               - name: X-Praxis-Version
                 value: "e2e"
-
-    insecure_options:
-      allow_unbounded_body: true
