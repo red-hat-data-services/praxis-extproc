@@ -1,55 +1,79 @@
+# syntax=docker/dockerfile:1
+
 # Multi-stage build for praxis-extproc (Konflux).
 #
-# Same as Containerfile, with base images pinned by digest for reproducible
-# supply-chain builds.
+# Aligned with Containerfile for digests, CARGO_FEATURES, and runtime layout.
+# ODH Konflux (.tekton/) builds Containerfile; red-hat-data-services uses this
+# file for downstream Konflux. Release builds use plain cargo (no cargo-auditable)
+# so hermetic Konflux builds do not need crates.io for the tool install; FIPS
+# manifest checks use Containerfile / make release-fips instead.
+# When digests or CARGO_FEATURES change, update Containerfile, this file, and Makefile.
 #
-# Builder: ubi9/ubi with AppStream rust-toolset (1.92) and openssl-devel.
-# Cargo --ignore-rust-version: crates declare rust-version 1.96; rustc 1.92
-# type-checks this tree. OPENSSL_NO_VENDOR forces openssl-sys onto system
-# libssl.so.3 (UBI9 OpenSSL) instead of a vendored copy.
-# Runtime: ubi9/ubi-minimal + openssl-libs (same SONAME).
+# Unlike Containerfile there is no report stage; make fips-check still uses
+# Containerfile --target report. Builder and runtime match Containerfile.
+
+ARG UBI9_DIGEST=sha256:beba9460df08acc9f2d5a99f61b8544d5367b05e02c945ca726c6f07ca5963a7
+ARG UBI9_MINIMAL_PQC_DIGEST=sha256:db10c80537d786068c7c911d7ef6ea103315d0615fa4b39b5946f7976563a8d7
+
+# Mirrors FIPS_FEATURES in the Makefile and Containerfile.
+ARG CARGO_FEATURES="responses,aws-sigv4"
+ARG CARGO_PROFILE=release
+ARG CARGO_ARGS="--ignore-rust-version"
 
 # ---------------------------------------------------------------------------
 # Builder
 # ---------------------------------------------------------------------------
 
-FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:beba9460df08acc9f2d5a99f61b8544d5367b05e02c945ca726c6f07ca5963a7 AS builder
+FROM registry.access.redhat.com/ubi9/ubi@${UBI9_DIGEST} AS builder
 
-ARG CARGO_PROFILE=release
-
-RUN dnf install -y rust-toolset openssl-devel gcc gcc-c++ cmake make \
+RUN dnf install -y --setopt=install_weak_deps=False \
+        rust-toolset openssl-devel gcc gcc-c++ cmake make \
     && dnf clean all
 
-ENV OPENSSL_NO_VENDOR=1
+ENV OPENSSL_NO_VENDOR=1 \
+    CARGO_HOME=/cargo
 
-WORKDIR /build
-COPY . .
+WORKDIR /src
 
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo .cargo
+COPY proto proto
+COPY src src
+COPY xtask xtask
 
-RUN set -eu; \
-    if [ "${CARGO_PROFILE}" = "release" ]; then \
-      cargo build --ignore-rust-version --release --bin praxis-extproc; \
-      BIN=target/release/praxis-extproc; \
-      strip "${BIN}"; \
-    elif [ "${CARGO_PROFILE}" = "debug" ]; then \
-      cargo build --ignore-rust-version --bin praxis-extproc; \
-      BIN=target/debug/praxis-extproc; \
-    else \
-      echo "unsupported CARGO_PROFILE=${CARGO_PROFILE}" >&2; \
-      exit 1; \
-    fi; \
-    cp "${BIN}" /praxis-extproc
+ARG CARGO_FEATURES
+ARG CARGO_PROFILE
+ARG CARGO_ARGS
+
+RUN --mount=type=cache,id=praxis-extproc-registry,target=/cargo/registry \
+    --mount=type=cache,id=praxis-extproc-target,target=/src/target \
+    set -eu; \
+    case "${CARGO_PROFILE}" in \
+      release) \
+        cargo build --release --locked -p praxis-extproc \
+            --no-default-features --features "${CARGO_FEATURES}" ${CARGO_ARGS}; \
+        BIN=target/release/praxis-extproc ;; \
+      debug) \
+        cargo build --locked -p praxis-extproc \
+            --no-default-features --features "${CARGO_FEATURES}" ${CARGO_ARGS}; \
+        BIN=target/debug/praxis-extproc ;; \
+      *) echo "unsupported CARGO_PROFILE=${CARGO_PROFILE}" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /out; \
+    cp "${BIN}" /out/praxis-extproc
 
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
 
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:db10c80537d786068c7c911d7ef6ea103315d0615fa4b39b5946f7976563a8d7
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc@${UBI9_MINIMAL_PQC_DIGEST} AS runtime
 
-RUN microdnf install -y openssl-libs \
-    && microdnf clean all
+LABEL org.opencontainers.image.source="https://github.com/opendatahub-io/praxis-extproc" \
+    org.opencontainers.image.description="Envoy ExtProc server for Praxis filter pipelines (FIPS build on UBI 9)" \
+    org.opencontainers.image.licenses="Apache-2.0"
 
-COPY --from=builder /praxis-extproc /usr/local/bin/praxis-extproc
+COPY --from=builder --chown=root:root --chmod=0555 \
+    /out/praxis-extproc /usr/local/bin/praxis-extproc
 
 USER 1001
 
