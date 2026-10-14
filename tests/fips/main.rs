@@ -113,7 +113,7 @@ fn fips_host() -> bool {
 /// Whether this build registers filters the FIPS build leaves out; mirrors
 /// the binary the same features built (see `fips::blocker`).
 fn carries_non_fips_filters() -> bool {
-    cfg!(any(feature = "policy-engine", feature = "responses-store"))
+    cfg!(any(feature = "policy-engine", feature = "responses-full"))
 }
 
 // -----------------------------------------------------------------------------

@@ -36,6 +36,15 @@ responses-store = ["responses", "praxis-ai-filters/store", "dep:praxis-ai-apis"]
 # Postgres and SQLite backends, Conversations, context compaction, MCP tools
 # and the file resolver. What the previous praxis-ai pin built in.
 responses-full = ["responses-store", "praxis-ai-filters/openai-all", "praxis-ai-filters/store-all"]
+# Certificate-only (mTLS) Postgres response store. Unlike store-postgres'
+# password path, it compiles no SCRAM password-auth crypto, no migration
+# checksums and no advisory-lock hashing, and runs SQL transport and the
+# client-certificate handshake through the system OpenSSL -- so it is FIPS
+# compliant (praxis-ai's own FIPS image ships exactly this). Deliberately kept
+# out of responses-full, whose SQLite and password-auth Postgres backends
+# (sqlx's `sha2`, SCRAM's md-5/hmac/sha2/hkdf) are not FIPS clean: this is the
+# store profile to select for a FIPS build.
+store-postgres-cert-auth = ["responses-store", "praxis-ai-filters/store-postgres-cert-auth"]
 integration = []
 k8s-e2e = []
 
@@ -44,17 +53,17 @@ async-trait = "0.1.89"
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 http = "1.4.0"
-# praxis-ai at its v0.4.1 release, where the larger capabilities are opt-in
+# praxis-ai at its v0.6.0 release, where the larger capabilities are opt-in
 # features; the [features] above choose which ones this server builds in.
-praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1", default-features = false, optional = true }
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1", default-features = false }
+praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.6.0", default-features = false, optional = true }
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.6.0", default-features = false }
 # The praxis version must match praxis-ai's pin so the PipelineExtension
 # types unify (praxis-ai pins the same 0.7 from crates.io). No default
 # features: praxis-filter's default turns on the policy engine, whose
 # plugins carry pure-Rust cryptography; the policy-engine feature above
 # opts back in.
-praxis-core = { version = "0.7.1", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.1", package = "praxis-proxy-filter", default-features = false }
+praxis-core = { version = "0.7.3", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.7.3", package = "praxis-proxy-filter", default-features = false }
 praxis-proto = { path = "proto", package = "praxis-proxy-proto" }
 hyper = { version = "1.9.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
@@ -68,7 +77,7 @@ openssl = "0.10.81"
 # never with `vendored`), whose provider module src/fips.rs delegates to;
 # rustls itself arrives transitively with its default features (aws-lc-rs)
 # kept off by every praxis crate.
-praxis-tls = { version = "0.7.1", package = "praxis-proxy-tls" }
+praxis-tls = { version = "0.7.3", package = "praxis-proxy-tls" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
 thiserror = "2.0.18"

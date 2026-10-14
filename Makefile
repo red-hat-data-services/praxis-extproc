@@ -128,13 +128,18 @@ images: container-release
 #
 #   policy-engine     the praxis policy filter's JWT, OAuth and Valkey
 #                     plugins carry aws-lc-rs, sha2 and hmac
-#   responses-store   the Responses store is built on sqlx, whose migration
-#                     checksums use sha2
+#   responses-full    its SQLite and password-auth Postgres store backends
+#                     bring sqlx's sha2 migration checksums and SCRAM's
+#                     md-5/hmac/sha2/hkdf, and its MCP tools pull aws-lc-rs
 #
-# The Responses filters (responses) and the SigV4 signer (aws-sigv4, which
-# signs through the system OpenSSL since praxis-ai moved it off sha2/hmac)
-# stay in. FIPS_FEATURES is the single place this is defined; the
-# Containerfile's CARGO_FEATURES default mirrors it and must be kept in sync.
+# What stays in: the Responses filters (responses); the SigV4 signer
+# (aws-sigv4), which signs through the system OpenSSL since praxis-ai moved it
+# off sha2/hmac; and the certificate-only Postgres Responses store
+# (store-postgres-cert-auth) -- the praxis-proxy sqlx fork compiles no
+# migration checksums and mTLS needs no SCRAM, so it pulls no sha2/hmac/md-5
+# and runs SQL transport and the client-cert handshake through system OpenSSL.
+# FIPS_FEATURES is the single place this is defined; the Containerfile's
+# CARGO_FEATURES default mirrors it and must be kept in sync.
 #
 # The local FIPS build goes to its own target directory so it never
 # overwrites, or is mistaken for, the default build.
@@ -175,7 +180,7 @@ images: container-release
 # attestation and the runtime probe are `cargo xtask fips` commands
 # (xtask/src/fips/). See docs/fips.md.
 
-FIPS_FEATURES           := responses,aws-sigv4
+FIPS_FEATURES           := responses,aws-sigv4,store-postgres-cert-auth
 # Overridable so the FIPS host run can point the whole recursion at a
 # container volume (see test-fips-host).
 FIPS_TARGET_DIR         ?= target/fips
@@ -215,7 +220,7 @@ FIPS_CARGO_ARGS         := -p praxis-extproc --no-default-features --features $(
 CARGO_AUDITABLE         := $(shell command -v cargo-auditable >/dev/null 2>&1 && echo "cargo auditable" || echo "cargo")
 FIPS_SBOM_ENV           := RUSTC_BOOTSTRAP=1 CARGO_BUILD_SBOM=true
 FIPS_SBOM_ARGS          := -Zsbom --config 'env.RUSTC_BOOTSTRAP.value="-1"' --config 'env.RUSTC_BOOTSTRAP.force=true'
-FIPS_UBI9_DIGEST        := sha256:beba9460df08acc9f2d5a99f61b8544d5367b05e02c945ca726c6f07ca5963a7
+FIPS_UBI9_DIGEST        := sha256:16e9e43d99e181463513cc84a514859b1abb9460f1c4d9e208da4b4e51cd5cc3
 FIPS_UBI9_MINIMAL_DIGEST := sha256:1d7c5517a4a1a8e2688620b39ee980e82505ca1ab7ae5541b5463120ae9b3897
 FIPS_UBI9_IMAGE         := registry.access.redhat.com/ubi9/ubi@$(FIPS_UBI9_DIGEST)
 FIPS_UBI9_MINIMAL_IMAGE := registry.access.redhat.com/ubi9/ubi-minimal@$(FIPS_UBI9_MINIMAL_DIGEST)
