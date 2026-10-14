@@ -435,14 +435,14 @@ async fn response_body_with_header_mutations() {
     );
 }
 
-/// Under BUFFERED, the response pipeline runs early at the response-headers
-/// phase, and `run_response_pipeline` skips `execute_response` at body EOS.
+/// Under BUFFERED with a body filter, the response pipeline defers to body EOS
+/// and runs `on_response` and `on_response_body` together on one shared context.
 /// A filter that stashes a decision in `filter_metadata` during `on_response`
 /// and reads it in `on_response_body` (the anthropic messages->chat-completions
-/// transform) only works if that metadata is persisted across the two phases.
-/// Regression test for the fix in `run_response_header_filters_early`: without
-/// it the transform metadata is dropped and the upstream (OpenAI-shaped) body
-/// passes through untransformed.
+/// transform) only works if both hooks see the same context. Regression test for
+/// the body-EOS deferral: if `on_response` ran early on a throwaway header-time
+/// context, the decision would be dropped and the upstream (OpenAI-shaped) body
+/// would pass through untransformed.
 #[tokio::test]
 async fn buffered_response_transform_metadata_survives_body_phase() {
     use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
