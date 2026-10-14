@@ -19,9 +19,11 @@
 #
 # The FIPS build differs from a default `cargo build` only in its cargo
 # features: it leaves out what carries pure-Rust cryptography (the praxis
-# policy engine, the Responses store; the SigV4 signer signs through the
-# system OpenSSL and stays in). CARGO_FEATURES defaults to the Makefile's
-# FIPS_FEATURES; keep the two in sync.
+# policy engine, and responses-full's SQLite and password-auth Postgres store
+# backends). The SigV4 signer signs through the system OpenSSL, and the
+# certificate-only Postgres store (store-postgres-cert-auth) carries no SCRAM
+# or migration-checksum crypto, so both stay in. CARGO_FEATURES defaults to
+# the Makefile's FIPS_FEATURES; keep the two in sync.
 #
 # Both base images are pinned by digest and their Red Hat signatures are
 # verified by `make fips-verify-image` before any podman build here. Update
@@ -37,7 +39,7 @@ ARG UBI9_DIGEST=sha256:beba9460df08acc9f2d5a99f61b8544d5367b05e02c945ca726c6f07c
 ARG UBI9_MINIMAL_DIGEST=sha256:1d7c5517a4a1a8e2688620b39ee980e82505ca1ab7ae5541b5463120ae9b3897
 
 # Mirrors FIPS_FEATURES in the Makefile.
-ARG CARGO_FEATURES="responses,aws-sigv4"
+ARG CARGO_FEATURES="responses,aws-sigv4,store-postgres-cert-auth"
 # release (the product image, with the embedded crate manifest) or debug (the
 # edit-compile loop; make container).
 ARG CARGO_PROFILE=release

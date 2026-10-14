@@ -36,13 +36,24 @@ know which features to pick:
 | | `cargo build` (default features) | The image (`FIPS_FEATURES` in the Makefile) |
 |---|---|---|
 | `responses`: the OpenAI Responses filters | yes | yes |
-| `responses-store`: the response store the Responses filters keep state in | yes | no: built on sqlx, whose migration checksums use `sha2` |
-| `responses-full`: the rest of what Praxis AI offers on that store (the Postgres and SQLite backends, Conversations, context compaction, MCP tools, the file resolver) | yes | no: all of it needs the store |
+| `responses-store`: the response store the Responses filters keep state in | yes | yes: through `store-postgres-cert-auth` below -- the praxis-proxy `sqlx` fork it builds on compiles no `sha2` migration checksums |
+| `store-postgres-cert-auth`: the certificate-only (mTLS) Postgres store backend | no (the default takes `responses-full`'s backends) | yes: SQL transport and the client-certificate handshake run through the system OpenSSL, and it compiles no SCRAM, migration-checksum or advisory-lock crypto |
+| `responses-full`: the rest of what Praxis AI offers on that store (the password-auth Postgres and SQLite backends, Conversations, context compaction, MCP tools, the file resolver) | yes | no: the SQLite and password-auth backends bring `sqlx`'s `sha2` and SCRAM's `md-5`/`hmac`/`sha2`/`hkdf`, and the MCP tools pull `aws-lc-rs` |
 | `aws-sigv4`: the `aws_sigv4_sign` filter | yes | yes: signs through the system OpenSSL (praxis-ai moved it off `sha2`/`hmac`; the `aws-sigv4` crate is only its test oracle) |
 | `policy-engine`: the praxis `policy` filter (the Praxis Policy Engine) | yes | no: its runtime and plugins carry `aws-lc-rs`, `sha2` and `hmac` |
 
 `FIPS_FEATURES` is defined once, in the Makefile; the `Containerfile`'s
 `CARGO_FEATURES` default mirrors it.
+
+The image carries the response store through the certificate-only Postgres
+backend (`store-postgres-cert-auth`), the profile praxis-ai's own FIPS image
+ships. SQL transport and the client-certificate (mTLS) handshake run through
+the system OpenSSL, and the praxis-proxy `sqlx` fork it builds on compiles no
+migration checksums, no SCRAM password authentication and no advisory-lock
+hashing, so it pulls none of `sha2`, `hmac` or `md-5`. The default build's
+store instead takes `responses-full`'s password-auth Postgres and SQLite
+backends, which do carry that cryptography, so the default `cargo build` has
+them and the image does not.
 
 ### Midstream vs downstream container files
 
@@ -73,23 +84,20 @@ podman build -f Dockerfile.konflux .
 
 ## What the FIPS build leaves out, in detail
 
-**The Responses store** (`responses-store`). The Responses filters share a
-response store registry, installed as a pipeline extension, that
-`openai_responses_rehydrate` reads earlier responses from
-(`previous_response_id` chaining) and `openai_response_store` writes finished
-responses to. Without it, stateless Responses requests work as before, and
-a configuration that names those two filters still starts, but a request
-that reaches `openai_responses_rehydrate` is rejected with a 500 ("response
-store is not available") and `openai_response_store` skips persistence.
-What makes it unclean is `sqlx-core`, which depends on `sha2` for its
-migration checksums, and Red Hat's scanner fails on the crate's name alone.
-Fixing it means either an in-memory store in praxis-ai that does not go
-through sqlx, or sqlx making `sha2` optional upstream.
+**The SQLite and password-auth Postgres store backends** (part of
+`responses-full`). The store registry itself ships — the image builds it on the
+certificate-only Postgres backend (see "The product image is the FIPS build"
+above): `sqlx`, `sqlx-core` and `sqlx-postgres` from the praxis-proxy fork,
+which compiles no `sha2` migration checksums, with certificate authentication
+that needs no SCRAM. What the image leaves out are the other backends: the
+SQLite backend (`sqlx-sqlite`, `libsqlite3-sys`) and the password-authenticated
+Postgres backend, whose SCRAM handshake pulls `md-5`, `hmac`, `sha2` and `hkdf`.
+A request that reaches `openai_responses_rehydrate` with no store configured is
+still rejected with a 500 ("response store is not available"); with the shipped
+certificate-only store it is served.
 
-**Everything on the store** (`responses-full`). The Postgres and SQLite
-store backends (`sqlx-postgres` adds `md-5`, `hmac`, `sha2` and `hkdf` of
-its own for SCRAM authentication), the Conversations API
-(`openai_conversations`), context compaction (`openai_responses_compact`),
+**The rest of what rides on the store** (`responses-full`). The Conversations
+API (`openai_conversations`), context compaction (`openai_responses_compact`),
 MCP tool resolution and dispatch (`rmcp`, whose HTTP transport is reqwest
 with its `rustls` feature, which compiles in `aws-lc-rs`), and the file
 resolver (`openai_file_resolve`, the same reqwest). All of them need the
@@ -302,8 +310,8 @@ Every crypto-adjacent component in the image, and why it is compliant:
 | x509-parser (parsing only, no `verify` feature) | peer certificate fields in the Pingora fork | parse only |
 | subtle, zeroize | constant-time comparison, wiping | helpers |
 | the `aws_sigv4_sign` filter (feature `aws-sigv4`) | AWS Signature V4 request signing | compliant: praxis-ai signs through the system OpenSSL (`openssl::hash`, `openssl::sign`); the `aws-sigv4` crate is only its dev-time test oracle |
-| sqlx-core (the Responses store) | migration checksums use sha2 | not in the FIPS build (feature `responses-store`) |
-| sqlx-postgres, rmcp, tiktoken-rs (everything on the store) | SCRAM authentication with md-5, hmac, sha2 and hkdf; reqwest with aws-lc-rs behind the MCP client; the tokenizer | not in the FIPS build (feature `responses-full`) |
+| sqlx, sqlx-core, sqlx-postgres (the certificate-only Postgres store, from the praxis-proxy fork) | SQL transport and the mTLS handshake through the system OpenSSL; the fork compiles no sha2 migration checksums and certificate auth needs no SCRAM | in the FIPS build (feature `store-postgres-cert-auth`), compliant |
+| md-5, hmac, sha2, hkdf (SCRAM for the password-auth Postgres store), sqlx-sqlite, libsqlite3-sys (the SQLite store), rmcp, tiktoken-rs | SCRAM password authentication; the SQLite driver; reqwest with aws-lc-rs behind the MCP client; the tokenizer | not in the FIPS build (feature `responses-full`) |
 | the praxis policy engine (praxis-policy) | its runtime and JWT, OAuth, Valkey builtins carry aws-lc, sha2 and hmac | not in the FIPS build (feature `policy-engine`) |
 | rcgen, reqwest with native-tls | test fixtures and clients | development only, absent from the shipped binary and its manifest |
 

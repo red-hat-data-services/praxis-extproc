@@ -75,9 +75,19 @@ pub fn install() -> Result<Status, ExtProcError> {
 ///
 /// - `policy`: the Praxis Policy Engine's JWT verification runs on `aws-lc-rs` (through `jsonwebtoken`) and its `OAuth`
 ///   and Valkey plugins use the pure-Rust `hmac` and `sha2` crates.
-/// - `openai_response_store`: registered exactly when the store is compiled in (feature `responses-store`), whose
-///   `sqlx` brings `sha2`. Everything on the store (`responses-full`) implies it, so this one name covers them all.
-const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_response_store"];
+/// - `openai_responses_store`: listed only when `responses-full` compiles a non-FIPS store backend -- its
+///   `store-sqlite` backend or its password-auth Postgres profile, which bring `sqlx`'s `sha2` and SCRAM's
+///   md-5/hmac/sha2/hkdf. The certificate-only profile (`store-postgres-cert-auth`) is FIPS compliant -- SQL transport
+///   and the client-certificate handshake run through the system OpenSSL and it compiles no migrations, password-auth
+///   or advisory-lock crypto -- so a build without `responses-full` omits the filter here even though it still
+///   registers.
+#[cfg(feature = "responses-full")]
+const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_responses_store"];
+
+/// Without `responses-full` no non-FIPS store backend is compiled -- the certificate-only Postgres store
+/// (`store-postgres-cert-auth`) is FIPS compliant -- so only the `policy` filter can block.
+#[cfg(not(feature = "responses-full"))]
+const NON_FIPS_FILTERS: &[&str] = &["policy"];
 
 /// Why this binary cannot honor [`REQUIRE_FIPS_ENV`], if it cannot.
 ///
@@ -237,14 +247,17 @@ mod tests {
     fn the_blocker_names_exactly_the_registered_non_fips_filters() {
         let registry = praxis_ai_filters::build_ai_registry();
         let blocker = blocker(&registry);
-        if cfg!(any(feature = "policy-engine", feature = "responses-store")) {
+        // The certificate-only Postgres store (`store-postgres-cert-auth`) is FIPS
+        // compliant; only `responses-full`'s SQLite and password-auth Postgres
+        // backends are not, so only `responses-full` blocks on the store filter.
+        if cfg!(any(feature = "policy-engine", feature = "responses-full")) {
             let reason = blocker.expect("a binary with non-FIPS filters is blocked");
             assert!(reason.contains("PRAXIS_REQUIRE_FIPS"), "{reason}");
             if cfg!(feature = "policy-engine") {
                 assert!(reason.contains("`policy` filter"), "{reason}");
             }
-            if cfg!(feature = "responses-store") {
-                assert!(reason.contains("`openai_response_store` filter"), "{reason}");
+            if cfg!(feature = "responses-full") {
+                assert!(reason.contains("`openai_responses_store` filter"), "{reason}");
             }
         } else {
             assert_eq!(blocker, None, "the FIPS feature set registers no blocked filter");
