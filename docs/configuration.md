@@ -392,3 +392,19 @@ At runtime:
 - **Filter rejection**: a `FilterAction::Reject`
   returns an `ImmediateResponse` to Envoy, which
   sends the rejection directly to the client.
+
+### Selected-upstream request-body filters
+
+Configure Envoy's request body mode as `BUFFERED` when a route can select an
+upstream and its pipeline contains a selected-upstream request-body filter.
+Envoy then sends a complete body to ExtProc after acknowledging headers;
+ExtProc can apply the selected-provider rewrite and return its body and header
+mutations in the body response. This also permits requests with trailers to
+finish without waiting for a deferred header response. `STREAMED`,
+`FULL_DUPLEX_STREAMED`, and `NONE` fail closed for bodyful requests that need
+this hook. Bodyless requests can still complete in any mode.
+
+Set Envoy's request buffer limit and ExtProc's `server.max_body_bytes` to
+values appropriate for the workload. Envoy can reject a buffered request
+before ExtProc sees it when its own limit is reached. Selected-upstream
+filters also enforce their configured input and translated-output limits.
