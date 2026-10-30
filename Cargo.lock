@@ -1748,6 +1748,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "humantime"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
+
+[[package]]
+name = "humantime-serde"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57a3db5ea5923d99402c94e9feb261dc5ee9b4efa158b0315f788cf549cc200c"
+dependencies = [
+ "humantime",
+ "serde",
+]
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2129,9 +2145,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.58.6"
+version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f622c574a29fb3034a0a90645afee194dfedc75fc124228801b6e77041075bd1"
+checksum = "a42a11b47492e6a2cc76e9c7bcc8077776cb31dac444e0795d7f61bcc6441c08"
 dependencies = [
  "ahash",
  "bytecount",
@@ -2157,23 +2173,24 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.58.6"
+version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a968fffd387b2ab005bf00c1851f5d26e90df05b6f7ad609ed0d620033cca5e7"
+checksum = "107aeb6ff14b8deb5610096a8ce5c554ec89806b521147eaeb3cae05b07edb7a"
 dependencies = [
  "regex-syntax",
 ]
 
 [[package]]
 name = "jsonschema-value"
-version = "0.58.6"
+version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39b7670345e5ce87371339d13705dbb9276b7e3e934bbe1efa2c6734a1f65a96"
+checksum = "e281d6b177bb4834f2ffd6f92aa0443cffe29c996b251c8d94eb6f456186feba"
 dependencies = [
  "ahash",
  "bytecount",
  "fraction",
  "getrandom 0.3.4",
+ "memchr",
  "num-cmp",
  "num-traits",
  "serde_json",
@@ -3112,8 +3129,8 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-apis"
-version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.8.0#c39f7198932d408b12f35cd57a2457067e67d0cf"
+version = "0.9.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.9.0#e88829542814df6f4496c2cc5e30f0d5072b313e"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3122,6 +3139,7 @@ dependencies = [
  "crc32fast",
  "futures",
  "http",
+ "humantime-serde",
  "jsonschema",
  "metrics",
  "notify",
@@ -3151,8 +3169,8 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-filters"
-version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.8.0#c39f7198932d408b12f35cd57a2457067e67d0cf"
+version = "0.9.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.9.0#e88829542814df6f4496c2cc5e30f0d5072b313e"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3183,11 +3201,12 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-store"
-version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.8.0#c39f7198932d408b12f35cd57a2457067e67d0cf"
+version = "0.9.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.9.0#e88829542814df6f4496c2cc5e30f0d5072b313e"
 dependencies = [
  "async-trait",
  "dashmap",
+ "humantime-serde",
  "serde",
  "serde_json",
  "tokio",
@@ -3196,8 +3215,8 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-store-backends"
-version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.8.0#c39f7198932d408b12f35cd57a2457067e67d0cf"
+version = "0.9.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.9.0#e88829542814df6f4496c2cc5e30f0d5072b313e"
 dependencies = [
  "async-trait",
  "futures",
@@ -3215,8 +3234,8 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-store-lifecycle"
-version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.8.0#c39f7198932d408b12f35cd57a2457067e67d0cf"
+version = "0.9.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.9.0#e88829542814df6f4496c2cc5e30f0d5072b313e"
 dependencies = [
  "dashmap",
  "praxis-ai-store",
@@ -3687,9 +3706,9 @@ dependencies = [
 
 [[package]]
 name = "pulldown-cmark"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+checksum = "278e9268c93b9e498a2da46c34d90ba93a3255eb99009646398f34bc73ab36eb"
 dependencies = [
  "bitflags 2.13.2",
  "memchr",
@@ -4040,9 +4059,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.58.6"
+version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "558f3855529c0a7e78a48e409fa653456e55f1b167eab4109c16a255b7727e3f"
+checksum = "f42818036d3b37cda6bd4c494543158a36e431cb717015ef7c93acc6ba214d3b"
 dependencies = [
  "ahash",
  "fluent-uri",
@@ -4484,9 +4503,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json_canonicalizer"
-version = "0.3.2"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe52319a927259afbfa5180c5157cd8167edfd3e8c254f9558c7fef44c5649f2"
+checksum = "87f7bb64f8c7e9f783fdfe883b5fe93a90bee1597c63705baa91842c5f698620"
 dependencies = [
  "ryu-js",
  "serde",
@@ -4996,7 +5015,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6318,27 +6337,27 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"
-version = "0.14.0"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf06bd8162af0734b344780deb55b42a2429ae430870d13fcc12f238e880fe6e"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "8.0.0"
+version = "8.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae42c0555055784c70058d19ba8e275528e8a99a706684868ace5da4e716a4ab"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.0+zstd.1.5.7"
+version = "2.1.2+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ef0a8027ec3ee71300ab3bcbcd0393f434aa72b91ca6d635a39941deae8eea0"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
 dependencies = [
  "cc",
  "pkg-config",

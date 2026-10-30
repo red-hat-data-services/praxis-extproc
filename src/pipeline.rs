@@ -39,6 +39,15 @@ pub(crate) enum RequestPhase {
     Body,
 }
 
+/// Runtime bounds and filter selection for one request-body phase.
+#[derive(Clone, Copy)]
+struct RequestBodyFilterOptions {
+    /// Whether to run ordinary body filters before provider-specific filters.
+    run_ordinary_body_filters: bool,
+    /// Server-side ceiling for bytes after body filters rewrite the input.
+    max_body_accumulation: Option<usize>,
+}
+
 /// Execute request pipeline for the given phase.
 ///
 /// Returns headers or body response with mutations.
@@ -89,12 +98,16 @@ async fn run_request_pipeline_inner(
     }
 
     let prior_len = state.request_body.len();
+    let max_body_accumulation = state.max_body_accumulation;
     if let Some(imm) = run_request_body_filters_at_eos(
         phase,
         pipeline,
         &mut ctx,
         &mut state.request_body,
-        run_ordinary_body_filters,
+        RequestBodyFilterOptions {
+            run_ordinary_body_filters,
+            max_body_accumulation,
+        },
     )
     .await?
     {
@@ -688,18 +701,18 @@ async fn run_request_body_filters_at_eos(
     pipeline: &FilterPipeline,
     ctx: &mut HttpFilterContext<'_>,
     request_body: &mut Vec<u8>,
-    run_ordinary_body_filters: bool,
+    options: RequestBodyFilterOptions,
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
     match phase {
         RequestPhase::Headers => Ok(None),
         RequestPhase::Body => {
-            if run_ordinary_body_filters {
+            if options.run_ordinary_body_filters {
                 let rejection = run_body_filters(pipeline, ctx, request_body, true).await?;
                 if rejection.is_some() {
                     return Ok(rejection);
                 }
             }
-            run_selected_upstream_body_filters(pipeline, ctx, request_body).await
+            run_selected_upstream_body_filters(pipeline, ctx, request_body, options.max_body_accumulation).await
         },
     }
 }
@@ -729,10 +742,15 @@ async fn run_body_filters(
 }
 
 /// Run selected-upstream body filters after request headers have selected a logical provider.
+///
+/// The filter's request limit is checked against the incoming body before this hook. Rewritten
+/// output uses the server accumulation ceiling so translation overhead does not consume the
+/// client's input allowance a second time.
 async fn run_selected_upstream_body_filters(
     pipeline: &FilterPipeline,
     ctx: &mut HttpFilterContext<'_>,
     body_buf: &mut Vec<u8>,
+    max_body_accumulation: Option<usize>,
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
     if !pipeline.body_capabilities().needs_selected_upstream_request_body
         || (ctx.cluster.is_none() && ctx.upstream.is_none())
@@ -752,7 +770,7 @@ async fn run_selected_upstream_body_filters(
         return Ok(Some(immediate));
     }
     if pipeline.body_capabilities().any_selected_upstream_request_body_writer
-        && body_buf.len() > pipeline.selected_upstream_request_body_limit()
+        && max_body_accumulation.is_some_and(|limit| body_buf.len() > limit)
     {
         metrics::record_body_size_rejection();
         return Ok(Some(adapter::rejection_to_immediate(
@@ -1614,15 +1632,37 @@ mod tests {
 
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "tests")]
-    async fn selected_upstream_writer_rejects_oversized_output() {
+    async fn selected_upstream_writer_allows_expansion_within_accumulation_limit() {
         let pipeline = single_filter_pipeline("selected_body_rewrite", SelectedBodyRewriteFilter::from_config);
         let mut state = StreamState::new();
         state.request = Some(adapter::envoy_headers_to_request(&[]));
-        state.request_body = vec![b'a'; 1020];
+        let input_limit = pipeline.selected_upstream_request_body_limit();
+        state.request_body = vec![b'a'; input_limit];
+        state.max_body_accumulation = Some(2048);
 
         let responses = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state, true)
             .await
-            .expect("oversized transformed body should receive a local reply");
+            .expect("rewritten output within the server accumulation limit should pass");
+        let emitted = responses.first().and_then(emitted_request_body);
+        assert_eq!(emitted.map(<[u8]>::len), Some(input_limit + 11));
+        assert!(
+            emitted.is_some_and(|body| body.len() > input_limit),
+            "rewriting may expand beyond the client-input limit"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn selected_upstream_writer_rejects_output_over_accumulation_limit() {
+        let pipeline = single_filter_pipeline("selected_body_rewrite", SelectedBodyRewriteFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.request_body = vec![b'a'; pipeline.selected_upstream_request_body_limit()];
+        state.max_body_accumulation = Some(1024);
+
+        let responses = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state, true)
+            .await
+            .expect("output over the configured accumulation limit should receive a local reply");
         assert_eq!(immediate_status(&responses), Some(413));
     }
 
