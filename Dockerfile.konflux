@@ -66,7 +66,7 @@ RUN --mount=type=cache,id=praxis-extproc-registry,target=/cargo/registry \
 # Runtime
 # ---------------------------------------------------------------------------
 
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc@${UBI9_MINIMAL_PQC_DIGEST} AS runtime
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:9.8@${UBI9_MINIMAL_PQC_DIGEST} AS runtime
 
 LABEL org.opencontainers.image.source="https://github.com/opendatahub-io/praxis-extproc" \
     org.opencontainers.image.description="Envoy ExtProc server for Praxis filter pipelines (FIPS build on UBI 9)" \
