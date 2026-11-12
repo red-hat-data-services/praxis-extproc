@@ -1,4 +1,4 @@
-packages: [rust-toolset, openssl-devel, gcc, gcc-c++, cmake, make] 
+packages: [rust-toolset, openssl-devel, gcc, gcc-c++, libstdc++, cmake, make] 
 contentOrigin:
   repofiles: ["./ubi.repo"] 
 arches: [x86_64, aarch64] 
