@@ -88,7 +88,7 @@ audit:
 	cargo deny check
 
 coverage-check:
-	cargo llvm-cov --fail-under-lines 93
+	cargo llvm-cov --fail-under-lines 95
 
 # ---------------------------------------------------------------------------
 # Container
@@ -483,8 +483,6 @@ e2e-teardown:
 e2e-test:
 	@case "$(MODE)" in fds|buffered|streamed) ;; *) echo "MODE must be fds, buffered, or streamed (got '$(MODE)')"; exit 1;; esac
 	E2E_BODY_MODE=$(MODE) bash hack/scripts/e2e-test.sh -- \
-		$(if $(filter fds,$(MODE)),--skip guardrails::,) \
-		$(if $(filter buffered streamed,$(MODE)),--skip fds_mode::,) \
 		$(if $(V),--nocapture,)
 
 # ---------------------------------------------------------------------------
@@ -553,7 +551,7 @@ help:
 	@echo "  fmt              format with nightly rustfmt"
 	@echo "  doc              build docs with warnings denied"
 	@echo "  audit            cargo audit + cargo deny"
-	@echo "  coverage-check   fail if line coverage < 93%%"
+	@echo "  coverage-check   fail if line coverage < 95%%"
 	@echo ""
 	@echo "Container (the product image is the FIPS build on UBI 9):"
 	@echo "  container         debug image (in-container cargo)"
