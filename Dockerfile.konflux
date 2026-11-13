@@ -12,7 +12,7 @@
 # Unlike Containerfile there is no report stage; make fips-check still uses
 # Containerfile --target report. Builder and runtime match Containerfile.
 
-ARG UBI9_DIGEST=sha256:8b212f75a0e5a156ac28b1c5c030d2e8a07715254e19d522286118279399af81
+ARG UBI9_DIGEST=sha256:1e9f0ed9fceafb40878bc1705ff124aa150e3fed873f18c42cdc2dded319e0a8
 ARG UBI9_MINIMAL_PQC_DIGEST=sha256:d638f3b49b79575329aacdae2739f954effe2467c12147711e73445c4fc97819
 
 # Mirrors FIPS_FEATURES in the Makefile and Containerfile.
