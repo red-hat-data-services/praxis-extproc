@@ -12,8 +12,8 @@
 # Unlike Containerfile there is no report stage; make fips-check still uses
 # Containerfile --target report. Builder and runtime match Containerfile.
 
-ARG UBI9_DIGEST=sha256:1963e00991088221a3405be7eb315a3dbc0be0f1f7440f0bd537d481cf33c83e
-ARG UBI9_MINIMAL_PQC_DIGEST=sha256:c7fdcf2617a608d07f95fa01d8936fc8bf898096a60e5ebc432aae8ead50ea6c
+ARG UBI9_DIGEST=sha256:1e9f0ed9fceafb40878bc1705ff124aa150e3fed873f18c42cdc2dded319e0a8
+ARG UBI9_MINIMAL_PQC_DIGEST=sha256:d638f3b49b79575329aacdae2739f954effe2467c12147711e73445c4fc97819
 
 # Mirrors FIPS_FEATURES in the Makefile and Containerfile.
 ARG CARGO_FEATURES="responses,aws-sigv4,store-postgres-cert-auth"
@@ -66,7 +66,7 @@ RUN --mount=type=cache,id=praxis-extproc-registry,target=/cargo/registry \
 # Runtime
 # ---------------------------------------------------------------------------
 
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc@${UBI9_MINIMAL_PQC_DIGEST} AS runtime
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:9.8@${UBI9_MINIMAL_PQC_DIGEST} AS runtime
 
 LABEL org.opencontainers.image.source="https://github.com/opendatahub-io/praxis-extproc" \
     org.opencontainers.image.description="Envoy ExtProc server for Praxis filter pipelines (FIPS build on UBI 9)" \
